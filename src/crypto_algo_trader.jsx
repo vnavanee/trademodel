@@ -1219,7 +1219,9 @@ function ExitRuleRow({ coin, rule, onChange, color }) {
   );
 }
 
-function SettingsModal({ creds, onSave, onClose }) {
+function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
+  // Plan limits with safe defaults (all features on if no Clerk)
+  const planLimits = limits || { maxCoins: 50, canLive: true, canAI: true };
   const defaultExitRules = {
     BTC: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
     ETH: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
@@ -1517,6 +1519,12 @@ function SettingsModal({ creds, onSave, onClose }) {
               <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 4 }}>
                 Buys driven by indicators. Sells triggered by exit rules only.
               </div>
+              {form.enabledCoins.length > planLimits.maxCoins && (
+                <div style={{ marginTop: 8, padding: "6px 10px", borderRadius: 6, background: "#fef3c711", border: "0.5px solid #f59e0b", fontSize: 11, color: "#92400e" }}>
+                  🔒 Your <strong>{clerkPlan || "free"}</strong> plan allows <strong>{planLimits.maxCoins}</strong> active coin{planLimits.maxCoins !== 1 ? "s" : ""}.{" "}
+                  <a href="/upgrade" style={{ color: "#f59e0b", fontWeight: 700 }}>Upgrade →</a>
+                </div>
+              )}
             </div>
 
             <div>
@@ -1763,10 +1771,12 @@ function SettingsModal({ creds, onSave, onClose }) {
             <div style={{ borderRadius: 10, border: `0.5px solid ${form.agentMode ? "#6366f1" : "var(--color-border-tertiary)"}`, padding: "14px 16px", background: form.agentMode ? "#6366f108" : "transparent" }}>
               <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
                 <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", flex: 1 }}>
-                  <input type="checkbox" checked={!!form.agentMode} onChange={e => set("agentMode", e.target.checked)} />
+                  <input type="checkbox" checked={!!form.agentMode}
+                    disabled={!planLimits.canAI}
+                    onChange={e => set("agentMode", e.target.checked)} />
                   <div>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: form.agentMode ? "#6366f1" : "var(--color-text-primary)" }}>
-                      {"🤖 LLM Agent mode (DeepSeek-V3)"}
+                    <div style={{ fontSize: 13, fontWeight: 700, color: !planLimits.canAI ? "var(--color-text-tertiary)" : form.agentMode ? "#6366f1" : "var(--color-text-primary)" }}>
+                      {"🤖 LLM Agent mode (DeepSeek-V3)"}{!planLimits.canAI && <span style={{ marginLeft: 8, fontSize: 10, background: "#f59e0b22", color: "#92400e", padding: "1px 7px", borderRadius: 4 }}>Pro AI only</span>}
                     </div>
                     <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 3 }}>
                       Replaces rule-based signals with DeepSeek AI. The agent receives all indicator values, position state,
@@ -2982,6 +2992,29 @@ function useWebSocketPrices(provider, coins, enabled, onPrice, onStatusChange) {
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 function CryptoAlgoTrader() {
+  // Clerk auth — signOut and current user
+  // These are no-ops when Clerk is not installed (plain app usage)
+  let signOut = null, clerkUser = null, clerkPlan = "pro_ai";
+  try {
+    const clerk = require("@clerk/clerk-react");
+    const { useClerk, useUser } = clerk;
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    const c = useClerk();
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    const { user } = useUser();
+    signOut   = c.signOut;
+    clerkUser = user;
+    clerkPlan = user?.publicMetadata?.plan || "free";
+  } catch (_) {
+    // Clerk not installed — all features unlocked (dev/standalone mode)
+    clerkPlan = "pro_ai";
+  }
+  const planLimits = {
+    free:   { maxCoins: 1,  canLive: false, canAI: false },
+    pro:    { maxCoins: 10, canLive: true,  canAI: false },
+    pro_ai: { maxCoins: 50, canLive: true,  canAI: true  },
+  };
+  const limits = planLimits[clerkPlan] || planLimits.pro_ai;
   useEffect(() => { document.title = "Crypto Trader"; }, []);
   const [selectedCoin, setSelectedCoin] = useState("BTC");
   const [running, setRunning] = useState(false);
@@ -4765,7 +4798,7 @@ function CryptoAlgoTrader() {
         a { color: inherit; }
       `}</style>
       <h2 className="sr-only">Crypto Trader</h2>
-      {showSettings && <SettingsModal creds={creds} onSave={(f) => { setCreds(f); setShowSettings(false); addAutoLog("Credentials updated", "info"); }} onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsModal creds={creds} limits={limits} clerkPlan={clerkPlan} onSave={(f) => { setCreds(f); setShowSettings(false); addAutoLog("Credentials updated", "info"); }} onClose={() => setShowSettings(false)} />}
 
       {/* ── Top toolbar ──────────────────────────────────────────────────────── */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
@@ -4790,6 +4823,27 @@ function CryptoAlgoTrader() {
             <i className="ti ti-settings" aria-hidden="true" /> Settings
             {hasCredentials && <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#10b981", display: "inline-block" }} />}
           </button>
+
+          {/* User badge + plan + logout — only shown when Clerk is active */}
+          {clerkUser && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 10,
+                background: clerkPlan === "pro_ai" ? "#10b98122" : clerkPlan === "pro" ? "#6366f122" : "#94a3b822",
+                color:      clerkPlan === "pro_ai" ? "#10b981"   : clerkPlan === "pro" ? "#6366f1"   : "#94a3b8",
+                fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, fontSize: 10 }}>
+                {clerkPlan === "pro_ai" ? "Pro AI" : clerkPlan === "pro" ? "Pro" : "Free"}
+              </span>
+              <span style={{ fontSize: 11, color: "var(--color-text-secondary)", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {clerkUser.primaryEmailAddress?.emailAddress || clerkUser.username || "User"}
+              </span>
+              <button
+                onClick={() => signOut && signOut()}
+                title="Sign out"
+                style={{ padding: "4px 10px", borderRadius: 6, border: "0.5px solid #ef444466", background: "transparent", cursor: "pointer", fontFamily: "inherit", fontSize: 11, color: "#ef4444", display: "flex", alignItems: "center", gap: 4 }}>
+                <i className="ti ti-logout" aria-hidden="true" /> Sign out
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -4837,11 +4891,18 @@ function CryptoAlgoTrader() {
                   style={{ padding: "6px 14px", borderRadius: 7, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-secondary)", color: "var(--color-text-secondary)", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
                   <i className="ti ti-player-play" aria-hidden="true" /> Simulate
                 </button>
-                {/* Live automation: requires credentials */}
-                <button onClick={startAutomation} disabled={!hasCredentials}
-                  style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #10b981", background: hasCredentials ? "#d1fae5" : "transparent", color: hasCredentials ? "#065f46" : "var(--color-text-secondary)", cursor: hasCredentials ? "pointer" : "not-allowed", fontFamily: "inherit", fontWeight: 600, fontSize: 12, opacity: hasCredentials ? 1 : 0.4 }}>
-                  <i className="ti ti-robot" aria-hidden="true" /> {hasCredentials ? "Start live" : "No credentials"}
-                </button>
+                {/* Live automation: requires credentials + Pro plan */}
+                {!limits.canLive ? (
+                  <div style={{ padding: "6px 14px", borderRadius: 7, border: "0.5px solid #f59e0b", background: "#fef3c711", fontSize: 12, color: "#92400e", display: "flex", alignItems: "center", gap: 6 }}>
+                    🔒 Live trading requires{" "}
+                    <a href="/upgrade" style={{ color: "#f59e0b", fontWeight: 700, textDecoration: "none" }}>Pro plan</a>
+                  </div>
+                ) : (
+                  <button onClick={startAutomation} disabled={!hasCredentials}
+                    style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #10b981", background: hasCredentials ? "#d1fae5" : "transparent", color: hasCredentials ? "#065f46" : "var(--color-text-secondary)", cursor: hasCredentials ? "pointer" : "not-allowed", fontFamily: "inherit", fontWeight: 600, fontSize: 12, opacity: hasCredentials ? 1 : 0.4 }}>
+                    <i className="ti ti-robot" aria-hidden="true" /> {hasCredentials ? "Start live" : "No credentials"}
+                  </button>
+                )}
               </div>
             ) : (
               <div style={{ display: "flex", gap: 6 }}>

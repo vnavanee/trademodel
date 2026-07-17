@@ -15,18 +15,35 @@
 //   ENCRYPTION_KEY          (32 random bytes as hex — for AES-256 key encryption)
 // ============================================================
 
-const { createClerkClient } = require("@clerk/clerk-sdk-node");
-const { createClient }      = require("@supabase/supabase-js");
-const crypto                = require("crypto");
+const crypto = require("crypto");
 
-// ─── Clients (initialised once at startup) ────────────────────────────────────
-const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+// ─── Lazy client getters ──────────────────────────────────────────────────────
+// Clients are created on first use so missing env vars don't crash the process
+// at startup — Cloud Run can bind the port before any auth endpoint is called.
+let _clerk = null, _supabase = null;
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY,  // service role bypasses RLS for trusted writes
-  { auth: { persistSession: false } }
-);
+function getClerk() {
+  if (!_clerk) {
+    const { createClerkClient } = require("@clerk/clerk-sdk-node");
+    if (!process.env.CLERK_SECRET_KEY) throw new Error("CLERK_SECRET_KEY not set");
+    _clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+  }
+  return _clerk;
+}
+
+function getSupabase() {
+  if (!_supabase) {
+    const { createClient } = require("@supabase/supabase-js");
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY)
+      throw new Error("SUPABASE_URL or SUPABASE_SERVICE_KEY not set");
+    _supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_KEY,
+      { auth: { persistSession: false } }
+    );
+  }
+  return _supabase;
+}
 
 // ─── Key encryption helpers (for exchange API keys at rest) ──────────────────
 const ENC_KEY = Buffer.from(process.env.ENCRYPTION_KEY || "", "hex"); // 32 bytes
@@ -83,11 +100,11 @@ async function requireAuth(req, res) {
     return null;
   }
   try {
-    const payload = await clerk.verifyToken(token);
+    const payload = await getClerk().verifyToken(token);
     const userId = payload.sub;
 
     // Fetch plan from Supabase (set by Stripe webhook)
-    const { data: user } = await supabase
+    const { data: user } = await getSupabase()
       .from("users")
       .select("plan, is_active")
       .eq("id", userId)
@@ -125,7 +142,7 @@ async function handleGetSettings(req, res) {
   const auth = await requireAuth(req, res);
   if (!auth) return;
 
-  const { data, error } = await supabase
+  const { data, error } = await getSupabase()
     .from("user_settings")
     .select("creds, updated_at")
     .eq("user_id", auth.userId)
@@ -179,7 +196,7 @@ async function handlePutSettings(req, res) {
 
   const encrypted = encryptCreds(creds);
 
-  const { error } = await supabase
+  const { error } = await getSupabase()
     .from("user_settings")
     .upsert({ user_id: auth.userId, creds: encrypted }, { onConflict: "user_id" });
 
@@ -189,7 +206,7 @@ async function handlePutSettings(req, res) {
   }
 
   // Audit log
-  await supabase.from("audit_log").insert({
+  await getSupabase().from("audit_log").insert({
     user_id: auth.userId, event: "settings_save",
     metadata: { coins: creds.customCoins, provider: creds.provider },
   });
@@ -222,7 +239,7 @@ async function handlePostTransaction(req, res) {
     return res.status(403).json({ error: "Transaction logging for live trades requires the Pro plan" });
   }
 
-  const { error } = await supabase.from("transactions").insert({
+  const { error } = await getSupabase().from("transactions").insert({
     user_id: auth.userId, mode, type, coin,
     price: price || null, qty: qty || null, usd_value: usdValue || null,
     pnl: pnl || null, fees: fees || null, net_pnl: netPnl || null,
@@ -305,25 +322,25 @@ async function handleStripeWebhook(req, res) {
       const plan   = PRICE_TO_PLAN[sub.items?.data?.[0]?.price?.id] || "free";
       const userId = sub.metadata?.clerk_user_id;
       if (!userId) break;
-      await supabase.from("subscriptions").upsert({
+      await getSupabase().from("subscriptions").upsert({
         user_id: userId, stripe_customer_id: sub.customer,
         stripe_sub_id: sub.id, plan, status: sub.status,
         current_period_end: new Date(sub.current_period_end * 1000).toISOString(),
         cancel_at_period_end: sub.cancel_at_period_end,
       }, { onConflict: "stripe_sub_id" });
       // Update user plan
-      await supabase.from("users").update({ plan }).eq("id", userId);
+      await getSupabase().from("users").update({ plan }).eq("id", userId);
       // Update Clerk public metadata so frontend sees the new plan immediately
-      await clerk.users.updateUserMetadata(userId, { publicMetadata: { plan } });
+      await getClerk().users.updateUserMetadata(userId, { publicMetadata: { plan } });
       break;
     }
     case "customer.subscription.deleted": {
       const userId = sub.metadata?.clerk_user_id;
       if (!userId) break;
-      await supabase.from("subscriptions").update({ status: "canceled" })
+      await getSupabase().from("subscriptions").update({ status: "canceled" })
         .eq("stripe_sub_id", sub.id);
-      await supabase.from("users").update({ plan: "free" }).eq("id", userId);
-      await clerk.users.updateUserMetadata(userId, { publicMetadata: { plan: "free" } });
+      await getSupabase().from("users").update({ plan: "free" }).eq("id", userId);
+      await getClerk().users.updateUserMetadata(userId, { publicMetadata: { plan: "free" } });
       break;
     }
   }
@@ -384,7 +401,7 @@ async function handleUserCreated(req, res) {
   if (evt.type === "user.created") {
     const { id, email_addresses, first_name, last_name } = evt.data;
     const email = email_addresses?.[0]?.email_address || "";
-    await supabase.from("users").upsert({
+    await getSupabase().from("users").upsert({
       id, email,
       display_name: [first_name, last_name].filter(Boolean).join(" ") || email,
       plan: "free",

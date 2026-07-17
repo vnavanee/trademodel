@@ -7,6 +7,10 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "@google-cloud/functions-framework": "^3.4.0"
+    "@clerk/clerk-sdk-node": "^4.13.23",
+    "@google-cloud/functions-framework": "^3.4.0",
+    "@supabase/supabase-js": "^2.110.5",
+    "stripe": "^22.3.1",
+    "svix": "^1.96.1"
   }
 }

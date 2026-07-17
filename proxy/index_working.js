@@ -1,15 +1,11 @@
 const https  = require("https");
 const crypto = require("crypto");
 
-// ─── Auth middleware (optional — only active when env vars are set) ───────────
-// If proxy_auth_middleware.js is missing or deps not installed, routes are skipped
-let authMiddleware = null;
-try {
-  authMiddleware = require("./proxy_auth_middleware");
-  console.log("[startup] auth middleware loaded");
-} catch (e) {
-  console.warn("[startup] auth middleware not loaded:", e.message);
-}
+/* const {
+  handleGetSettings, handlePutSettings,
+  handlePostTransaction, handleGetTransactions,
+  handleSubscribe, handleStripeWebhook, handleUserCreated,
+} = require("./proxy_auth_middleware"); */
 
 const NEWSDATA_HOST = "newsdata.io";
 const NEWSDATA_KEY  = "pub_7e39169f4e394355a99f1f06ca08b392";
@@ -720,21 +716,15 @@ exports.ticker = async (req, res) => {
 
   const route = req.path || "/";
   console.log(`[request] method=${req.method} route=${route}`);
-
-  // ── Auth-gated routes (only when middleware is loaded) ──────────────────────
-  if (authMiddleware) {
-    const { handleGetSettings, handlePutSettings,
-            handlePostTransaction, handleGetTransactions,
-            handleSubscribe, handleStripeWebhook, handleUserCreated } = authMiddleware;
-    if (route === "/settings"     && req.method === "GET")  return handleGetSettings(req, res);
-    if (route === "/settings"     && req.method === "PUT")  return handlePutSettings(req, res);
-    if (route === "/transactions" && req.method === "POST") return handlePostTransaction(req, res);
-    if (route === "/transactions" && req.method === "GET")  return handleGetTransactions(req, res);
-    if (route === "/subscribe"    && req.method === "POST") return handleSubscribe(req, res);
-    if ((route === "/webhook"  || route === "/webhook/")  && req.method === "POST") return handleStripeWebhook(req, res);
-    if ((route === "/users"    || route === "/users/")    && req.method === "POST") return handleUserCreated(req, res);
-  }
-
+/* 
+  if (route === "/settings"     && req.method === "GET")  return handleGetSettings(req, res);
+if (route === "/settings"     && req.method === "PUT")  return handlePutSettings(req, res);
+if (route === "/transactions" && req.method === "POST") return handlePostTransaction(req, res);
+if (route === "/transactions" && req.method === "GET")  return handleGetTransactions(req, res);
+if (route === "/subscribe"    && req.method === "POST") return handleSubscribe(req, res);
+if (route === "/webhook"      && req.method === "POST") return handleStripeWebhook(req, res);
+if (route === "/users"        && req.method === "POST") return handleUserCreated(req, res);
+ */
   // ── POST /advancedbuy ────────────────────────────────────────────────────
   if (route === "/advancedbuy" || route === "/advancedbuy/") {
     if (req.method !== "POST") return res.status(405).json({ error: "Use POST /advancedbuy" });
