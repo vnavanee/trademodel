@@ -1,4 +1,7 @@
 import { useState, useEffect, useRef, useCallback, Component } from "react";
+// Clerk auth — requires: npm install @clerk/clerk-react
+// If not using auth, these are unused but don't break anything
+import { useClerk, useUser } from "@clerk/clerk-react";
 
 // ─── Error Boundary — shows readable crash message instead of blank screen ────
 class ErrorBoundary extends Component {
@@ -221,6 +224,116 @@ function calcATR(prices, period = 14) {
 // ─── Mean Reversion Signal ───────────────────────────────────────────────────
 // Generates BUY when price is oversold/below bands, SELL when overbought/above bands
 // Opposite of momentum — buys dips and sells rips in ranging markets
+// ─── Custom Rule Engine ──────────────────────────────────────────────────────
+// Evaluates a tree of user-defined conditions against live indicator values.
+// Structure: groups[] → each group has conditions[] + AND/OR logic within group
+//            groups are combined with groupLogic (AND/OR)
+
+// Map indicator names to their current values
+function resolveIndicatorValue(name, indicators, prices, volumeRatio) {
+  const p = indicators.currentPrice || prices?.at(-1) || 0;
+  switch (name) {
+    case "rsi":          return indicators.rsi ?? null;
+    case "macd":         return indicators.macd ?? null;
+    case "macdNorm":     return p > 0 ? (indicators.macd ?? 0) / p * 100 : null;
+    case "bollingerPct": {
+      const b = indicators.boll;
+      if (!b || b.upper === b.lower) return null;
+      return (p - b.lower) / (b.upper - b.lower);
+    }
+    case "sma20dist":    return indicators.sma20 ? (p - indicators.sma20) / indicators.sma20 * 100 : null;
+    case "sma50dist":    return indicators.sma50 ? (p - indicators.sma50) / indicators.sma50 * 100 : null;
+    case "sma99dist":    return indicators.sma99 ? (p - indicators.sma99) / indicators.sma99 * 100 : null;
+    case "emaSpread":    return indicators.ema12 && indicators.ema26
+      ? (indicators.ema12 - indicators.ema26) / indicators.ema26 * 100 : null;
+    case "atr":          return indicators.atr ?? null;
+    case "atrPct":       return indicators.atr && p ? indicators.atr / p * 100 : null;
+    case "volume":       return volumeRatio ?? null;
+    case "price":        return p;
+    case "rfProb":       return null; // set externally via rfPredCache
+    case "lstmTrend":    return null; // set externally via lstmPredCache
+    case "lstmDirProb":  return null; // set externally
+    default:             return null;
+  }
+}
+
+// Evaluate a single condition: value OP threshold
+function evalCondition(condition, indicators, prices, volumeRatio, extra = {}) {
+  if (!condition.enabled) return true; // disabled conditions always pass
+  const val = extra[condition.indicator] ?? resolveIndicatorValue(condition.indicator, indicators, prices, volumeRatio);
+  if (val === null || val === undefined) return false; // indicator not available
+  const thr = parseFloat(condition.value);
+  if (isNaN(thr)) return false;
+  switch (condition.op) {
+    case "<":  return val < thr;
+    case "<=": return val <= thr;
+    case ">":  return val > thr;
+    case ">=": return val >= thr;
+    case "=":  return Math.abs(val - thr) < 0.0001;
+    case "!=": return Math.abs(val - thr) >= 0.0001;
+    default:   return false;
+  }
+}
+
+// Evaluate a group of conditions
+function evalGroup(group, indicators, prices, volumeRatio, extra = {}) {
+  const enabled = group.conditions.filter(c => c.enabled !== false);
+  if (enabled.length === 0) return false;
+  const results = enabled.map(c => evalCondition(c, indicators, prices, volumeRatio, extra));
+  return group.logic === "or"
+    ? results.some(Boolean)
+    : results.every(Boolean);
+}
+
+// Evaluate all groups and return a signal
+function evalCustomRules(customRules, indicators, prices, volumeRatio, extra = {}) {
+  if (!customRules?.enabled || !customRules.groups?.length) return null;
+
+  const signals = [];
+  for (const group of customRules.groups) {
+    if (!group.conditions?.length) continue;
+    const passed = evalGroup(group, indicators, prices, volumeRatio, extra);
+    if (passed) signals.push({ action: group.action || "BUY", weight: group.weight || 1, label: group.label });
+  }
+
+  if (signals.length === 0) return null;
+
+  // Tally weighted votes
+  let buyWeight = 0, sellWeight = 0;
+  signals.forEach(s => {
+    if (s.action === "BUY")  buyWeight  += s.weight;
+    if (s.action === "SELL") sellWeight += s.weight;
+  });
+
+  const groupLogic = customRules.groupLogic || "and";
+  const totalGroups = customRules.groups.filter(g => g.conditions?.length).length;
+
+  let action = "HOLD";
+  if (groupLogic === "or") {
+    // Any passing group triggers
+    if (buyWeight > 0 && buyWeight >= sellWeight)  action = "BUY";
+    if (sellWeight > 0 && sellWeight > buyWeight) action = "SELL";
+  } else {
+    // AND: majority by weight
+    const totalWeight = customRules.groups.reduce((s, g) => s + (g.weight || 1), 0);
+    if (buyWeight  > totalWeight * 0.5) action = "BUY";
+    if (sellWeight > totalWeight * 0.5) action = "SELL";
+  }
+
+  const score = (buyWeight - sellWeight).toFixed(2);
+  const confidence = Math.min(99, Math.round(Math.max(buyWeight, sellWeight) / (buyWeight + sellWeight + 0.01) * 100));
+
+  return {
+    action,
+    confidence: String(confidence),
+    score,
+    agreeingCount: signals.length,
+    totalIndicators: totalGroups,
+    reasons: signals.map(s => ({ label: `${s.label}: ${s.action}`, vote: s.action === "BUY" ? 1 : -1 })),
+    fromCustomRules: true,
+  };
+}
+
 function generateMeanReversionSignal(indicators, volumeRatio, feePercent) {
   const signals = [];
   const w = (weight, vote, label) => signals.push({ weight, vote, label });
@@ -390,10 +503,32 @@ function generateSignal(indicators, newsSentiment, volumeRatio, indicatorConfig 
     ? Math.min((agreeingWeight / totalActiveWeight) * 100, 99)
     : 0;
 
-  // ── Action: BUY requires score threshold AND minimum agreeing indicators ──
+  // ── Action: apply AND / OR / custom combiner logic ─────────────────────────
   const agreeingCount = agreeing.length;
+  const combiner      = indicatorConfig?._ruleCombiner || { logic: "and", minAgree: 3, customThreshold: 0.3 };
+  const logic         = combiner.logic || "and";
+  const minAgree      = parseInt(combiner.minAgree) || 3;
+  const customThr     = parseFloat(combiner.customThreshold) || 0.3;
+
   let action = "HOLD";
-  if (score > 2 && agreeingCount >= MIN_AGREEING_INDICATORS) action = "BUY";
+  const buyScore  = score > 0;
+  const sellScore = score < 0;
+
+  if (logic === "or") {
+    // OR: any single strong indicator is enough
+    const strongBuy  = signals.some(s => s.vote > 0 && s.weight >= 2);
+    const strongSell = signals.some(s => s.vote < 0 && s.weight >= 2);
+    if (buyScore  && (score > 1 || strongBuy))  action = "BUY";
+    if (sellScore && (score < -1 || strongSell)) action = "SELL";
+  } else if (logic === "custom") {
+    // custom: score must exceed threshold AND minimum indicators must agree
+    if (score  > customThr  * 5 && agreeingCount >= minAgree) action = "BUY";
+    if (score < -customThr  * 5 && agreeingCount >= minAgree) action = "SELL";
+  } else {
+    // and (default): score threshold AND minimum agreeing indicators
+    if (score > 2  && agreeingCount >= minAgree) action = "BUY";
+    if (score < -2 && agreeingCount >= minAgree) action = "SELL";
+  }
 
   const reasons = [
     ...signals.map((s) => ({ label: s.label, vote: s.vote })),
@@ -1255,6 +1390,10 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
     cooldownMinutes:   creds.cooldownMinutes   || "1",
     agentMode:          creds.agentMode !== undefined ? creds.agentMode : false,
     signalSource:       creds.signalSource       || "rules",
+    llmProvider:        creds.llmProvider        || "deepseek",
+    llmKeys:            creds.llmKeys            || { deepseek:"", claude:"", gpt:"", gemini:"", llama:"" },
+    customRules:        creds.customRules         || { enabled:false, groupLogic:"and", groups:[] },
+    ruleCombiner:       creds.ruleCombiner        || { logic:"and", customThreshold:"0.3", minAgree:"3" },
     agentIntervalSec:   creds.agentIntervalSec   || "15",
     adaptiveSettings:   creds.adaptiveSettings   || { enabled: false, maxTpDelta: "2", maxSlDelta: "1", requireHigh: "70", applyAfter: "3" },
     tradingMode:        creds.tradingMode        || "momentum",
@@ -1307,7 +1446,9 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
   const setExitStrategy = (key, patch) => set("exitStrategies", { ...form.exitStrategies, [key]: { ...form.exitStrategies[key], ...patch } });
   const setIndicator    = (key, patch) => set("indicatorConfig",  { ...form.indicatorConfig,  [key]: { ...form.indicatorConfig[key],  ...patch } });
   const setIndicatorPeriod = (key, value) => set("indicatorPeriods", { ...form.indicatorPeriods, [key]: parseInt(value) || 1 });
-  const setDynamicExits = (patch) => set("dynamicExits", { ...form.dynamicExits, ...patch });
+  const setDynamicExits  = (patch) => set("dynamicExits",  { ...form.dynamicExits,  ...patch });
+  const setRuleCombiner  = (patch) => set("ruleCombiner",  { ...form.ruleCombiner,  ...patch });
+  const setLlmKey        = (provider, val) => set("llmKeys", { ...form.llmKeys, [provider]: val });
   const setSellOrder    = (patch)       => set("sellOrderConfig",  { ...form.sellOrderConfig, ...patch });
   const setBuyOrder         = (patch) => set("buyOrderConfig",    { ...form.buyOrderConfig,    ...patch });
   const setPostBuyLimitSell = (patch) => set("postBuyLimitSell", { ...form.postBuyLimitSell, ...patch });
@@ -1339,10 +1480,15 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
         </div>
 
         {/* Tabs */}
-        <div style={{ display: "flex", gap: 6, marginBottom: 20, flexWrap: "wrap" }}>
-          <button style={tabStyle("provider")} onClick={() => setActiveTab("provider")}>🏦 Exchange</button>
-          <button style={tabStyle("credentials")} onClick={() => setActiveTab("credentials")}>🔑 Credentials</button>
-          <button style={tabStyle("trading")} onClick={() => setActiveTab("trading")}>📊 Trading Rules</button>
+        <div style={{ display: "flex", gap: 5, marginBottom: 20, flexWrap: "wrap" }}>
+          <button style={tabStyle("provider")}     onClick={() => setActiveTab("provider")}>🏦 Exchange</button>
+          <button style={tabStyle("credentials")}  onClick={() => setActiveTab("credentials")}>🔑 Keys</button>
+          <button style={tabStyle("llm")}          onClick={() => setActiveTab("llm")}>🤖 AI / LLM</button>
+          <button style={tabStyle("signals")}      onClick={() => setActiveTab("signals")}>📡 Signals</button>
+          <button style={tabStyle("execution")}    onClick={() => setActiveTab("execution")}>⚡ Execution</button>
+          <button style={tabStyle("exits")}        onClick={() => setActiveTab("exits")}>🎯 Exits</button>
+          <button style={tabStyle("indicators")}   onClick={() => setActiveTab("indicators")}>📊 Indicators</button>
+          <button style={tabStyle("rules")}         onClick={() => setActiveTab("rules")}>⚙️ Rules</button>
         </div>
 
         {/* ── Tab: Exchange selector ─────────────────────────────────────── */}
@@ -1451,8 +1597,134 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
           </div>
         )}
 
-        {/* ── Tab: Trading Rules ──────────────────────────────────────────── */}
-        {activeTab === "trading" && (
+
+        {/* ── Tab: AI / LLM ────────────────────────────────────────────────── */}
+        {activeTab === "llm" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+
+            {/* LLM Provider selector */}
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: "var(--color-text-secondary)" }}>
+                AI Provider
+                <span style={{ fontSize: 10, fontWeight: 400, color: "var(--color-text-tertiary)", marginLeft: 8 }}>
+                  Select the LLM that powers the trading agent
+                </span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
+                {[
+                  { id: "deepseek", label: "DeepSeek V3",  icon: "🔮", note: "Best value. Fast, accurate, low cost.",         envKey: "DEEPSEEK_API_KEY",   link: "platform.deepseek.com" },
+                  { id: "gpt",      label: "GPT-4o Mini",  icon: "⚡", note: "OpenAI. Reliable, widely tested.",              envKey: "OPENAI_API_KEY",     link: "platform.openai.com"   },
+                  { id: "claude",   label: "Claude Haiku",  icon: "🧠", note: "Anthropic. Strong reasoning, nuanced.",         envKey: "ANTHROPIC_API_KEY",  link: "console.anthropic.com" },
+                  { id: "gemini",   label: "Gemini Flash",  icon: "💡", note: "Google. Fast and free tier available.",         envKey: "GEMINI_API_KEY",     link: "aistudio.google.com"   },
+                  { id: "llama",    label: "Llama 3.1",     icon: "🦙", note: "Meta via Groq. Open source, very fast.",        envKey: "GROQ_API_KEY",       link: "console.groq.com"      },
+                ].map(p => (
+                  <div key={p.id} onClick={() => set("llmProvider", p.id)}
+                    style={{ padding: "12px 14px", borderRadius: 9, cursor: "pointer",
+                      border: `0.5px solid ${form.llmProvider === p.id ? "#6366f1" : "var(--color-border-tertiary)"}`,
+                      background: form.llmProvider === p.id ? "#6366f112" : "var(--color-background-secondary)" }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: form.llmProvider === p.id ? "#6366f1" : "var(--color-text-primary)", marginBottom: 3 }}>
+                      {p.icon} {p.label}
+                      {form.llmProvider === p.id && <span style={{ fontSize: 9, marginLeft: 6, background: "#6366f122", color: "#6366f1", padding: "1px 6px", borderRadius: 4 }}>ACTIVE</span>}
+                    </div>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginBottom: 4 }}>{p.note}</div>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", fontFamily: "monospace" }}>{p.envKey}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* API Key fields for all providers */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {[
+                  { id: "deepseek", label: "DeepSeek API Key",   placeholder: "sk-...",                link: "https://platform.deepseek.com/api_keys"   },
+                  { id: "gpt",      label: "OpenAI API Key",      placeholder: "sk-...",                link: "https://platform.openai.com/api-keys"      },
+                  { id: "claude",   label: "Anthropic API Key",   placeholder: "sk-ant-...",            link: "https://console.anthropic.com/settings/keys"},
+                  { id: "gemini",   label: "Google Gemini Key",   placeholder: "AIza...",               link: "https://aistudio.google.com/app/apikey"    },
+                  { id: "llama",    label: "Groq API Key (Llama)",placeholder: "gsk_...",               link: "https://console.groq.com/keys"             },
+                ].map(p => (
+                  <div key={p.id} style={{ display: "flex", gap: 10, alignItems: "flex-end",
+                    opacity: form.llmProvider === p.id ? 1 : 0.5 }}>
+                    <label style={{ flex: 1, fontSize: 12 }}>
+                      <div style={{ color: "var(--color-text-secondary)", marginBottom: 4, display: "flex", gap: 8, alignItems: "center" }}>
+                        {p.label}
+                        {form.llmProvider === p.id && <span style={{ fontSize: 9, background: "#6366f122", color: "#6366f1", padding: "1px 5px", borderRadius: 3 }}>ACTIVE</span>}
+                      </div>
+                      <input
+                        type="password"
+                        value={form.llmKeys?.[p.id] || ""}
+                        onChange={e => setLlmKey(p.id, e.target.value)}
+                        placeholder={p.placeholder}
+                        style={{ width: "100%", boxSizing: "border-box", fontFamily: "monospace", fontSize: 11 }}
+                      />
+                    </label>
+                    <a href={p.link} target="_blank" rel="noreferrer"
+                      style={{ fontSize: 10, color: "#6366f1", textDecoration: "none", marginBottom: 6, whiteSpace: "nowrap" }}>
+                      Get key ↗
+                    </a>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ marginTop: 10, fontSize: 10, color: "var(--color-text-tertiary)", lineHeight: 1.6, padding: "8px 10px", borderRadius: 6, background: "var(--color-background-secondary)" }}>
+                ⚠️ API keys are sent to your Cloud Run proxy and stored as environment variables — never exposed in the browser.
+                The active provider ({form.llmProvider}) is sent with each agent request and the proxy uses the matching env var key.
+              </div>
+            </div>
+
+            {/* Rule combiner */}
+            <div style={{ borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "14px 16px" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: "var(--color-text-secondary)" }}>
+                Rule combiner logic
+                <span style={{ fontSize: 10, fontWeight: 400, color: "var(--color-text-tertiary)", marginLeft: 8 }}>
+                  How indicators are combined when using Rules signal source
+                </span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 12 }}>
+                {[
+                  { value: "and",    label: "AND",    desc: "All N indicators must agree. Most selective, fewer trades." },
+                  { value: "or",     label: "OR",     desc: "Any strong indicator triggers. More trades, higher risk." },
+                  { value: "custom", label: "Custom", desc: "Set your own score threshold and min agreeing count." },
+                ].map(m => (
+                  <div key={m.value} onClick={() => setRuleCombiner({ logic: m.value })}
+                    style={{ padding: "9px 11px", borderRadius: 7, cursor: "pointer",
+                      border: `0.5px solid ${form.ruleCombiner?.logic === m.value ? "#10b981" : "var(--color-border-tertiary)"}`,
+                      background: form.ruleCombiner?.logic === m.value ? "#10b98112" : "var(--color-background-secondary)" }}>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: form.ruleCombiner?.logic === m.value ? "#10b981" : "var(--color-text-primary)" }}>{m.label}</div>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>{m.desc}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <label style={{ fontSize: 12 }}>
+                  <div style={{ color: "var(--color-text-secondary)", marginBottom: 4 }}>
+                    Min agreeing indicators
+                  </div>
+                  <input type="number" value={form.ruleCombiner?.minAgree || "3"} min="1" max="10"
+                    onChange={e => setRuleCombiner({ minAgree: e.target.value })}
+                    style={{ width: "100%", boxSizing: "border-box" }} />
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                    Used by AND and Custom modes
+                  </div>
+                </label>
+                {form.ruleCombiner?.logic === "custom" && (
+                  <label style={{ fontSize: 12 }}>
+                    <div style={{ color: "var(--color-text-secondary)", marginBottom: 4 }}>Score threshold (0–1)</div>
+                    <input type="number" value={form.ruleCombiner?.customThreshold || "0.3"} min="0" max="1" step="0.05"
+                      onChange={e => setRuleCombiner({ customThreshold: e.target.value })}
+                      style={{ width: "100%", boxSizing: "border-box" }} />
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                      Fraction of max score needed to signal
+                    </div>
+                  </label>
+                )}
+              </div>
+            </div>
+
+
+          </div>
+        )}
+
+        {/* ── Tab: Signals ─────────────────────────────────────────────────── */}
+        {activeTab === "signals" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
               <label style={{ fontSize: 12 }}>
@@ -1837,6 +2109,13 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
               )}
             </div>
 
+          </div>
+        )}
+
+        {/* ── Tab: Execution ────────────────────────────────────────────────── */}
+        {activeTab === "execution" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+
             {/* ── Buy order type ─────────────────────────────────────── */}
             <div>
               <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 10, fontWeight: 600 }}>
@@ -1918,6 +2197,13 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                 );
               })()}
             </div>
+
+          </div>
+        )}
+
+        {/* ── Tab: Exits ────────────────────────────────────────────────────── */}
+        {activeTab === "exits" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
 
             {/* ── Dynamic exits based on cumulative P&L ─────────── */}
             <div style={{ borderRadius: 10, border: `0.5px solid ${form.dynamicExits?.enabled ? "#f59e0b" : "var(--color-border-tertiary)"}`, padding: "14px 16px", background: form.dynamicExits?.enabled ? "#fef3c708" : "transparent" }}>
@@ -2243,6 +2529,13 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
               })()}
             </div>
 
+          </div>
+        )}
+
+        {/* ── Tab: Indicators ───────────────────────────────────────────────── */}
+        {activeTab === "indicators" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+
             {/* ── Tick interval ──────────────────────────────────────────── */}
             <div style={{ borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "14px 16px" }}>
               <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: "var(--color-text-secondary)" }}>
@@ -2370,6 +2663,201 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
 
           </div>
         )}
+
+        {/* ── Tab: Complex Rules ───────────────────────────────────────────────── */}
+        {activeTab === "rules" && (() => {
+          const cr   = form.customRules || { enabled: false, groupLogic: "and", groups: [] };
+          const setCr = (patch) => set("customRules", { ...cr, ...patch });
+          const INDICATORS = [
+            { value: "rsi",          label: "RSI (14)",           unit: "0–100",     hint: "e.g. < 35 for oversold" },
+            { value: "macd",         label: "MACD",               unit: "price",     hint: "e.g. > 0 for bullish crossover" },
+            { value: "macdNorm",     label: "MACD % of price",    unit: "%",         hint: "normalised MACD" },
+            { value: "bollingerPct", label: "Bollinger %B",       unit: "0–1",       hint: "< 0.2 = near lower band" },
+            { value: "sma20dist",    label: "Price vs SMA20 (%)", unit: "%",         hint: "e.g. > 0 = above SMA20" },
+            { value: "sma50dist",    label: "Price vs SMA50 (%)", unit: "%",         hint: "" },
+            { value: "sma99dist",    label: "Price vs SMA99 (%)", unit: "%",         hint: "" },
+            { value: "emaSpread",    label: "EMA12-26 spread (%)", unit: "%",        hint: "> 0 = EMA12 above EMA26" },
+            { value: "atrPct",       label: "ATR % of price",     unit: "%",         hint: "volatility proxy" },
+            { value: "volume",       label: "Volume ratio",        unit: "×avg",     hint: "> 1.2 = above average" },
+            { value: "rfProb",       label: "RF direction P↑",    unit: "0–1",       hint: "> 0.6 = RF bullish" },
+            { value: "lstmDirProb",  label: "LSTM direction P↑",  unit: "0–1",       hint: "> 0.6 = LSTM bullish" },
+            { value: "lstmTrend",    label: "LSTM trend score",   unit: "-1 to +1",  hint: "> 0 = uptrend" },
+          ];
+          const OPS = ["<", "<=", ">", ">=", "=", "!="];
+          const newId = () => Math.random().toString(36).slice(2, 7);
+
+          const addGroup = () => setCr({ groups: [...(cr.groups||[]), {
+            id: newId(), label: `Rule ${(cr.groups||[]).length + 1}`,
+            logic: "and", action: "BUY", weight: 1,
+            conditions: [{ id: newId(), indicator: "rsi", op: "<", value: "35", enabled: true }],
+          }]});
+
+          const updateGroup = (gid, patch) => setCr({ groups: cr.groups.map(g => g.id===gid ? { ...g, ...patch } : g) });
+          const removeGroup = (gid) => setCr({ groups: cr.groups.filter(g => g.id !== gid) });
+
+          const addCond = (gid) => updateGroup(gid, {
+            conditions: [...cr.groups.find(g=>g.id===gid).conditions,
+              { id: newId(), indicator: "rsi", op: "<", value: "35", enabled: true }]
+          });
+          const updateCond = (gid, cid, patch) => updateGroup(gid, {
+            conditions: cr.groups.find(g=>g.id===gid).conditions.map(c => c.id===cid ? { ...c, ...patch } : c)
+          });
+          const removeCond = (gid, cid) => updateGroup(gid, {
+            conditions: cr.groups.find(g=>g.id===gid).conditions.filter(c => c.id !== cid)
+          });
+
+          return (
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              {/* Header toggle */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px",
+                borderRadius: 9, border: `0.5px solid ${cr.enabled ? "#10b981" : "var(--color-border-tertiary)"}`,
+                background: cr.enabled ? "#10b98108" : "transparent" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
+                  <input type="checkbox" checked={!!cr.enabled} onChange={e => setCr({ enabled: e.target.checked })} />
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: cr.enabled ? "#10b981" : "var(--color-text-primary)" }}>
+                      Complex rule engine {cr.enabled ? "ACTIVE" : "OFF"}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>
+                      When enabled, custom rules override the standard signal generator.
+                      Rules are evaluated every tick — each passing group casts a weighted vote.
+                    </div>
+                  </div>
+                </label>
+                {cr.enabled && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                    <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>Groups combine via</span>
+                    {["and","or"].map(l => (
+                      <button key={l} onClick={() => setCr({ groupLogic: l })}
+                        style={{ padding: "3px 12px", borderRadius: 5, fontSize: 11, fontWeight: 700,
+                          border: `0.5px solid ${cr.groupLogic===l ? "#10b981" : "var(--color-border-tertiary)"}`,
+                          background: cr.groupLogic===l ? "#10b98122" : "transparent",
+                          color: cr.groupLogic===l ? "#10b981" : "var(--color-text-secondary)", cursor: "pointer" }}>
+                        {l.toUpperCase()}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Rule groups */}
+              {cr.enabled && (
+                <>
+                  {(cr.groups||[]).map((group, gi) => (
+                    <div key={group.id} style={{ borderRadius: 9, border: "0.5px solid var(--color-border-tertiary)",
+                      padding: "12px 14px", background: "var(--color-background-secondary)" }}>
+                      {/* Group header */}
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                        <input value={group.label} onChange={e => updateGroup(group.id, { label: e.target.value })}
+                          style={{ flex: 1, fontSize: 12, fontWeight: 600, background: "transparent",
+                            border: "none", borderBottom: "0.5px solid var(--color-border-tertiary)",
+                            color: "var(--color-text-primary)", padding: "2px 4px", outline: "none" }} />
+                        <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>conditions:</span>
+                        {["and","or"].map(l => (
+                          <button key={l} onClick={() => updateGroup(group.id, { logic: l })}
+                            style={{ padding: "2px 9px", borderRadius: 4, fontSize: 10, fontWeight: 700,
+                              border: `0.5px solid ${group.logic===l ? "#6366f1" : "var(--color-border-tertiary)"}`,
+                              background: group.logic===l ? "#6366f122" : "transparent",
+                              color: group.logic===l ? "#6366f1" : "var(--color-text-secondary)", cursor: "pointer" }}>
+                            {l.toUpperCase()}
+                          </button>
+                        ))}
+                        <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>→</span>
+                        {["BUY","SELL","HOLD"].map(a => (
+                          <button key={a} onClick={() => updateGroup(group.id, { action: a })}
+                            style={{ padding: "2px 9px", borderRadius: 4, fontSize: 10, fontWeight: 800,
+                              border: `0.5px solid ${group.action===a ? (a==="BUY"?"#10b981":a==="SELL"?"#ef4444":"#94a3b8") : "var(--color-border-tertiary)"}`,
+                              background: group.action===a ? (a==="BUY"?"#10b98122":a==="SELL"?"#ef444422":"transparent") : "transparent",
+                              color: group.action===a ? (a==="BUY"?"#10b981":a==="SELL"?"#ef4444":"#94a3b8") : "var(--color-text-tertiary)",
+                              cursor: "pointer" }}>
+                            {a}
+                          </button>
+                        ))}
+                        <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--color-text-secondary)" }}>
+                          W:
+                          <input type="number" value={group.weight||1} min="1" max="10"
+                            onChange={e => updateGroup(group.id, { weight: parseFloat(e.target.value)||1 })}
+                            style={{ width: 36, fontSize: 11, padding: "2px 4px", borderRadius: 4,
+                              border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                        </label>
+                        <button onClick={() => removeGroup(group.id)}
+                          title="Remove group"
+                          style={{ background:"none", border:"none", cursor:"pointer", color:"#ef4444", fontSize:14, padding:"2px 4px" }}>×</button>
+                      </div>
+
+                      {/* Conditions */}
+                      {group.conditions.map((cond, ci) => {
+                        const indInfo = INDICATORS.find(i => i.value === cond.indicator);
+                        return (
+                          <div key={cond.id} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
+                            <input type="checkbox" checked={cond.enabled !== false}
+                              onChange={e => updateCond(group.id, cond.id, { enabled: e.target.checked })} />
+                            {/* IF label */}
+                            <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", minWidth: 14 }}>
+                              {ci === 0 ? "IF" : group.logic.toUpperCase()}
+                            </span>
+                            {/* Indicator selector */}
+                            <select value={cond.indicator}
+                              onChange={e => updateCond(group.id, cond.id, { indicator: e.target.value })}
+                              style={{ flex: 2, fontSize: 11, padding: "3px 6px", borderRadius: 4,
+                                border: "0.5px solid var(--color-border-secondary)",
+                                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+                              {INDICATORS.map(i => <option key={i.value} value={i.value}>{i.label}</option>)}
+                            </select>
+                            {/* Operator */}
+                            <select value={cond.op}
+                              onChange={e => updateCond(group.id, cond.id, { op: e.target.value })}
+                              style={{ width: 50, fontSize: 11, padding: "3px 4px", borderRadius: 4,
+                                border: "0.5px solid var(--color-border-secondary)",
+                                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+                              {OPS.map(o => <option key={o} value={o}>{o}</option>)}
+                            </select>
+                            {/* Threshold */}
+                            <input type="number" value={cond.value}
+                              onChange={e => updateCond(group.id, cond.id, { value: e.target.value })}
+                              placeholder={indInfo?.hint || "value"}
+                              style={{ width: 70, fontSize: 11, padding: "3px 6px", borderRadius: 4,
+                                border: "0.5px solid var(--color-border-secondary)",
+                                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                            {/* Unit hint */}
+                            <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", minWidth: 40 }}>
+                              {indInfo?.unit || ""}
+                            </span>
+                            {/* Remove condition */}
+                            <button onClick={() => removeCond(group.id, cond.id)}
+                              style={{ background:"none", border:"none", cursor:"pointer", color:"var(--color-text-tertiary)", fontSize:13, padding:"0 3px" }}>×</button>
+                          </div>
+                        );
+                      })}
+                      <button onClick={() => addCond(group.id)}
+                        style={{ marginTop: 4, fontSize: 10, color: "#6366f1", background: "transparent",
+                          border: "0.5px dashed #6366f166", borderRadius: 4, padding: "3px 10px", cursor: "pointer" }}>
+                        + Add condition
+                      </button>
+                    </div>
+                  ))}
+
+                  <button onClick={addGroup}
+                    style={{ padding: "8px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+                      border: "0.5px dashed #6366f1", background: "transparent",
+                      color: "#6366f1", cursor: "pointer", width: "100%" }}>
+                    + Add rule group
+                  </button>
+
+                  {/* Legend */}
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", lineHeight: 1.7,
+                    padding: "8px 12px", borderRadius: 7, background: "var(--color-background-secondary)" }}>
+                    <strong>How it works:</strong> Each group evaluates its conditions using AND/OR logic.
+                    Passing groups cast a weighted vote (W) toward their action (BUY/SELL/HOLD).
+                    Groups are then combined using the top-level AND/OR combiner.
+                    W (weight) controls how strongly a group's vote counts vs others.
+                    RF and LSTM indicators are available once the models have warmed up.
+                  </div>
+                </>
+              )}
+            </div>
+          );
+        })()}
 
         {/* Footer */}
         <div style={{ display: "flex", gap: 10, marginTop: 22, justifyContent: "flex-end" }}>
@@ -2829,7 +3317,7 @@ Respond ONLY with valid JSON, no other text:
   const response = await fetch(`${PROXY_BASE}/agent`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({ prompt, provider: context.llmProvider || "deepseek" }),
   });
 
   if (!response.ok) {
@@ -2990,31 +3478,30 @@ function useWebSocketPrices(provider, coins, enabled, onPrice, onStatusChange) {
   return { disconnect };
 }
 
+// ─── Clerk auth hook ─────────────────────────────────────────────────────────
+// Defined outside CryptoAlgoTrader so it follows React Rules of Hooks.
+// Returns safe defaults if Clerk is not configured (standalone/dev mode).
+function useClerkAuth() {
+  const { signOut } = useClerk();
+  const { user }    = useUser();
+  return {
+    clerkUser:    user   || null,
+    clerkSignOut: signOut || null,
+    clerkPlan:    user?.publicMetadata?.plan || "free",
+  };
+}
+
 // ─── Main Component ───────────────────────────────────────────────────────────
 function CryptoAlgoTrader() {
-  // Clerk auth — signOut and current user
-  // These are no-ops when Clerk is not installed (plain app usage)
-  let signOut = null, clerkUser = null, clerkPlan = "pro_ai";
-  try {
-    const clerk = require("@clerk/clerk-react");
-    const { useClerk, useUser } = clerk;
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    const c = useClerk();
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    const { user } = useUser();
-    signOut   = c.signOut;
-    clerkUser = user;
-    clerkPlan = user?.publicMetadata?.plan || "free";
-  } catch (_) {
-    // Clerk not installed — all features unlocked (dev/standalone mode)
-    clerkPlan = "pro_ai";
-  }
+  // Clerk auth — @clerk/clerk-react must be installed (npm install @clerk/clerk-react)
+  // useClerkAuth is defined just before this component (see below)
+  const { clerkUser, clerkSignOut, clerkPlan } = useClerkAuth();
   const planLimits = {
     free:   { maxCoins: 1,  canLive: false, canAI: false },
     pro:    { maxCoins: 10, canLive: true,  canAI: false },
     pro_ai: { maxCoins: 50, canLive: true,  canAI: true  },
   };
-  const limits = planLimits[clerkPlan] || planLimits.pro_ai;
+  const limits = planLimits[clerkPlan] || planLimits.free;
   useEffect(() => { document.title = "Crypto Trader"; }, []);
   const [selectedCoin, setSelectedCoin] = useState("BTC");
   const [running, setRunning] = useState(false);
@@ -3061,9 +3548,49 @@ function CryptoAlgoTrader() {
       maxSlTighten:    "30",   // % — max decrease to SL when losing (protect capital)
       scaleBy:         "total", // "total" (all coins) | "per_coin" (this coin's P&L only)
     },
+    llmProvider: "deepseek",   // "deepseek" | "claude" | "gpt" | "gemini" | "llama"
+    llmKeys: {
+      deepseek: "", claude: "", gpt: "", gemini: "", llama: "",
+    },
     agentMode: false,
     agentIntervalSec: "15",
-    signalSource: "rules",  // "rules" | "rf" | "lstm" | "rf+lstm" | "deepseek"
+    signalSource: "rules",
+    customRules: {
+      enabled: false,
+      // Each group is evaluated independently then combined with groupLogic
+      groupLogic: "and",   // "and" | "or" — how groups combine
+      groups: [
+        {
+          id: "g1",
+          label: "Oversold entry",
+          logic: "and",   // "and" | "or" within this group
+          action: "BUY",  // what this group signals when it passes
+          weight: 2,      // vote weight when group passes
+          conditions: [
+            { id: "c1", indicator: "rsi",    op: "<",  value: "35",  enabled: true },
+            { id: "c2", indicator: "macd",   op: ">",  value: "0",   enabled: true },
+          ],
+        },
+        {
+          id: "g2",
+          label: "Overbought exit",
+          logic: "or",
+          action: "SELL",
+          weight: 2,
+          conditions: [
+            { id: "c3", indicator: "rsi",         op: ">",  value: "65", enabled: true },
+            { id: "c4", indicator: "bollingerPct", op: ">",  value: "0.9", enabled: true },
+          ],
+        },
+      ],
+    },
+    ruleCombiner: {
+      logic: "and",    // "and" | "or" | "custom"
+      // custom: define per-indicator vote threshold (0.0–1.0 fraction of weighted score)
+      customThreshold: "0.3",
+      // minimum number of indicators that must agree when logic = "and"
+      minAgree: "3",
+    },
     tradingMode: "momentum",   // "momentum" | "mean_reversion"
     volatilityGate: {
       enabled:       true,
@@ -3475,6 +4002,7 @@ function CryptoAlgoTrader() {
           const atrPct = atr && price ? (atr / price * 100) : null;
           const rfPred = rfPredCache[coin] || null;
           const decision = await callLLMAgent({
+            llmProvider: creds.llmProvider || "deepseek",
             coin, currentPrice: price,
             indicators: { ...indicators, atr },
             atrPct,
@@ -4250,13 +4778,25 @@ function CryptoAlgoTrader() {
       }
 
       // ── Signal source routing ─────────────────────────────────────────────────
-      // signalSource controls which model drives BUY/SELL decisions
       const src = creds.signalSource || "rules";
 
-      // Rule-based fallback (always available)
-      const ruleSignal = creds.tradingMode === "mean_reversion"
-        ? generateMeanReversionSignal(indicators, volumeRatio, creds.feePercent)
-        : generateSignal(indicators, activeSentiment, volumeRatio, creds.indicatorConfig);
+      // Extra values for custom rule conditions that need RF/LSTM data
+      const ruleExtra = {
+        rfProb:      rfPredCache[coin]?.directionProbability ?? null,
+        lstmTrend:   lstmPredCache[coin]?.trendScore         ?? null,
+        lstmDirProb: lstmPredCache[coin]?.directionProbability ?? null,
+      };
+
+      // Custom rule engine — evaluated first if enabled, overrides standard rules
+      const customRuleSignal = creds.customRules?.enabled
+        ? evalCustomRules(creds.customRules, indicators, cs.prices, volumeRatio, ruleExtra)
+        : null;
+
+      // Standard rule-based signal
+      const ruleSignal = customRuleSignal
+        || (creds.tradingMode === "mean_reversion"
+          ? generateMeanReversionSignal(indicators, volumeRatio, creds.feePercent)
+          : generateSignal(indicators, activeSentiment, volumeRatio, { ...creds.indicatorConfig, _ruleCombiner: creds.ruleCombiner }));
 
       // DeepSeek agent decision (async, may be stale)
       const agentDecision = (src === "deepseek") && agentDecisionRef.current?.[coin];
@@ -4837,7 +5377,7 @@ function CryptoAlgoTrader() {
                 {clerkUser.primaryEmailAddress?.emailAddress || clerkUser.username || "User"}
               </span>
               <button
-                onClick={() => signOut && signOut()}
+                onClick={() => clerkSignOut && clerkSignOut()}
                 title="Sign out"
                 style={{ padding: "4px 10px", borderRadius: 6, border: "0.5px solid #ef444466", background: "transparent", cursor: "pointer", fontFamily: "inherit", fontSize: 11, color: "#ef4444", display: "flex", alignItems: "center", gap: 4 }}>
                 <i className="ti ti-logout" aria-hidden="true" /> Sign out

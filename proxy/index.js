@@ -914,73 +914,73 @@ exports.ticker = async (req, res) => {
   }
 
   // ── POST /agent ──────────────────────────────────────────────────────────
-  // Proxies Anthropic API calls — API key lives on the server, never in browser
+  // Multi-provider LLM router — supports DeepSeek, GPT, Claude, Gemini, Llama
   if (route === "/agent" || route === "/agent/") {
+    if (req.method !== "POST") return res.status(405).json({ error: "Use POST /agent" });
     let body;
     try { body = await readBody(req); } catch (e) {
-      return res.status(400).json({ error: "Invalid JSON", detail: e.message });
+      return res.status(400).json({ error: "Invalid JSON" });
     }
-    const { prompt } = body;
-    if (req.method !== "POST") return res.status(405).json({ error: "Use POST /agent with JSON body: { prompt }" });
+    const { prompt, provider = "deepseek" } = body;
     if (!prompt) return res.status(400).json({ error: "Missing prompt field" });
 
-    // DeepSeek API key — set as Cloud Run env var: DEEPSEEK_API_KEY
-    const apiKey = process.env.DEEPSEEK_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: "DEEPSEEK_API_KEY not set on server. Add it as a Cloud Run environment variable." });
+    const LLM_CONFIGS = {
+      deepseek: { hostname: "api.deepseek.com",           path: "/v1/chat/completions",    model: "deepseek-chat",             envKey: "DEEPSEEK_API_KEY",  format: "openai" },
+      gpt:      { hostname: "api.openai.com",             path: "/v1/chat/completions",    model: "gpt-4o-mini",               envKey: "OPENAI_API_KEY",    format: "openai" },
+      claude:   { hostname: "api.anthropic.com",          path: "/v1/messages",            model: "claude-3-5-haiku-20241022", envKey: "ANTHROPIC_API_KEY", format: "claude" },
+      gemini:   { hostname: "generativelanguage.googleapis.com", path: null,               model: "gemini-1.5-flash",          envKey: "GEMINI_API_KEY",    format: "gemini" },
+      llama:    { hostname: "api.groq.com",               path: "/openai/v1/chat/completions", model: "llama-3.1-8b-instant",  envKey: "GROQ_API_KEY",      format: "openai" },
+    };
+
+    const cfg = LLM_CONFIGS[provider];
+    if (!cfg) return res.status(400).json({ error: `Unknown provider: ${provider}` });
+    const apiKey = process.env[cfg.envKey];
+    if (!apiKey) return res.status(500).json({ error: `${cfg.envKey} not set on Cloud Run` });
 
     try {
-      // DeepSeek uses OpenAI-compatible API format
-      const deepseekRes = await new Promise((resolve, reject) => {
-        const bodyStr = JSON.stringify({
-          model: "deepseek-chat",   // deepseek-chat = DeepSeek-V3 (fastest, cheapest)
-          max_tokens: 512,
-          temperature: 0.1,         // low temperature for consistent JSON output
-          messages: [{ role: "user", content: prompt }],
+      let bodyStr, headers, path = cfg.path;
+
+      if (cfg.format === "gemini") {
+        path = `/v1beta/models/${cfg.model}:generateContent?key=${apiKey}`;
+        bodyStr = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 512 } });
+        headers = { "Content-Type": "application/json" };
+      } else if (cfg.format === "claude") {
+        bodyStr = JSON.stringify({ model: cfg.model, max_tokens: 512, messages: [{ role: "user", content: prompt }] });
+        headers = { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" };
+      } else {
+        bodyStr = JSON.stringify({ model: cfg.model, max_tokens: 512, temperature: 0.1, messages: [{ role: "user", content: prompt }] });
+        headers = { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` };
+      }
+      headers["Content-Length"] = Buffer.byteLength(bodyStr);
+
+      const llmRes = await new Promise((resolve, reject) => {
+        const req2 = https.request({ hostname: cfg.hostname, path, method: "POST", headers }, (r) => {
+          let data = "";
+          r.on("data", c => data += c);
+          r.on("end", () => { try { resolve({ status: r.statusCode, data: JSON.parse(data) }); } catch { resolve({ status: r.statusCode, data }); } });
         });
-        const req2 = https.request(
-          {
-            hostname: "api.deepseek.com",
-            path: "/v1/chat/completions",
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${apiKey}`,
-              "Content-Length": Buffer.byteLength(bodyStr),
-            },
-          },
-          (r) => {
-            let data = "";
-            r.on("data", c => data += c);
-            r.on("end", () => {
-              try { resolve({ status: r.statusCode, data: JSON.parse(data) }); }
-              catch { resolve({ status: r.statusCode, data }); }
-            });
-          }
-        );
         req2.on("error", reject);
-        req2.setTimeout(30000, () => req2.destroy(new Error("DeepSeek API timeout")));
-        req2.write(bodyStr);
-        req2.end();
+        req2.setTimeout(30000, () => req2.destroy(new Error(`${provider} timeout`)));
+        req2.write(bodyStr); req2.end();
       });
 
-      if (deepseekRes.status !== 200) {
-        return res.status(502).json({
-          error: `DeepSeek API returned HTTP ${deepseekRes.status}`,
-          detail: typeof deepseekRes.data === "object" ? deepseekRes.data?.error?.message : deepseekRes.data,
-        });
+      if (llmRes.status !== 200) {
+        return res.status(502).json({ error: `${provider} API HTTP ${llmRes.status}`, detail: llmRes.data?.error?.message || JSON.stringify(llmRes.data).slice(0,200) });
       }
 
-      // DeepSeek follows OpenAI response format: choices[0].message.content
-      const text = deepseekRes.data?.choices?.[0]?.message?.content || "";
-      console.log(`[agent] DeepSeek response length: ${text.length}`);
-      return res.status(200).json({ text, fetchedAt: new Date().toISOString() });
+      const text = cfg.format === "gemini"
+        ? llmRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || ""
+        : cfg.format === "claude"
+          ? llmRes.data?.content?.[0]?.text || ""
+          : llmRes.data?.choices?.[0]?.message?.content || "";
 
+      console.log(`[agent] ${provider} response: ${text.length} chars`);
+      return res.status(200).json({ text, provider, fetchedAt: new Date().toISOString() });
     } catch (e) {
-      console.error("[agent] error:", e.message);
+      console.error(`[agent] ${provider} error:`, e.message);
       return res.status(502).json({ error: e.message });
     }
   }
-
   // ── GET /orderstatus ─────────────────────────────────────────────────────
   if (route === "/orderstatus" && req.method === "GET") {
     const { exchange, orderId, productId } = req.query;

@@ -17,6 +17,30 @@
 
 const crypto = require("crypto");
 
+// ─── Body parser ──────────────────────────────────────────────────────────────
+// Cloud Run Functions Framework may pre-parse JSON onto req.body, or stream raw.
+// This handles both cases — mirrors the readBody in index.js.
+function readBody(req) {
+  // Already parsed by Functions Framework
+  if (req.body !== undefined && req.body !== null) {
+    if (typeof req.body === "object") return Promise.resolve(req.body);
+    if (typeof req.body === "string") {
+      try   { return Promise.resolve(JSON.parse(req.body)); }
+      catch { return Promise.resolve({}); }
+    }
+  }
+  // Raw stream — read and parse manually
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", chunk => { data += chunk; });
+    req.on("end", () => {
+      try   { resolve(data ? JSON.parse(data) : {}); }
+      catch { reject(new Error(`Invalid JSON body: ${data.slice(0, 100)}`)); }
+    });
+    req.on("error", reject);
+  });
+}
+
 // ─── Lazy client getters ──────────────────────────────────────────────────────
 // Clients are created on first use so missing env vars don't crash the process
 // at startup — Cloud Run can bind the port before any auth endpoint is called.
@@ -101,20 +125,70 @@ async function requireAuth(req, res) {
   }
   try {
     const payload = await getClerk().verifyToken(token);
-    const userId = payload.sub;
+    const userId  = payload.sub;
 
-    // Fetch plan from Supabase (set by Stripe webhook)
-    const { data: user } = await getSupabase()
+    // Try to find user row in Supabase
+    const { data: user, error: fetchErr } = await getSupabase()
       .from("users")
-      .select("plan, is_active")
+      .select("plan, is_active, email")
       .eq("id", userId)
       .single();
 
-    if (!user || !user.is_active) {
-      res.status(403).json({ error: "Account inactive or not found" });
+    // If user row doesn't exist yet — create it automatically with plan:"free"
+    if (!user || fetchErr?.code === "PGRST116") {
+      console.log(`[auth] user ${userId} not in DB — auto-creating`);
+
+      // Pull email from Clerk — gracefully skip if CLERK_SECRET_KEY not set
+      let email = payload.email || `${userId}@unknown.local`;
+      try {
+        const clerkUser = await getClerk().users.getUser(userId);
+        email = clerkUser.emailAddresses?.[0]?.emailAddress || email;
+        console.log(`[auth] got email from Clerk: ${email}`);
+      } catch (e) {
+        console.warn(`[auth] could not fetch email from Clerk: ${e.message}`);
+      }
+
+      // Use service role client — bypasses RLS entirely
+      const sb = getSupabase();
+      const { data: inserted, error: insertErr } = await sb
+        .from("users")
+        .upsert(
+          { id: userId, email, display_name: email, plan: "free", is_active: true },
+          { onConflict: "id", ignoreDuplicates: false }
+        )
+        .select("plan, is_active")
+        .single();
+
+      if (insertErr) {
+        // Log the full error detail so Cloud Run logs show exactly what failed
+        console.error("[auth] upsert error:", JSON.stringify(insertErr));
+        // Still try to proceed — maybe the row was created by a concurrent request
+        // Do one final read before giving up
+        const { data: retry } = await sb
+          .from("users").select("plan, is_active").eq("id", userId).single();
+        if (retry) {
+          console.log("[auth] row found on retry — concurrent insert race, continuing");
+          return { userId, plan: retry.plan || "free" };
+        }
+        res.status(500).json({
+          error: "Failed to initialise user account",
+          detail: insertErr.message,
+          hint: "Check SUPABASE_SERVICE_KEY is the service_role key (not anon key), and the users table exists",
+        });
+        return null;
+      }
+
+      console.log(`[auth] auto-created user ${userId} plan=free`);
+      return { userId, plan: inserted?.plan || "free" };
+    }
+
+    if (!user.is_active) {
+      res.status(403).json({ error: "Account has been deactivated — contact support" });
       return null;
     }
+
     return { userId, plan: user.plan || "free" };
+
   } catch (e) {
     console.error("[auth] token verification failed:", e.message);
     res.status(401).json({ error: "Invalid or expired token" });
