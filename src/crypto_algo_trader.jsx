@@ -233,6 +233,7 @@ function calcATR(prices, period = 14) {
 function resolveIndicatorValue(name, indicators, prices, volumeRatio) {
   const p = indicators.currentPrice || prices?.at(-1) || 0;
   switch (name) {
+    // ── Technical indicators ─────────────────────────────────────────────────
     case "rsi":          return indicators.rsi ?? null;
     case "macd":         return indicators.macd ?? null;
     case "macdNorm":     return p > 0 ? (indicators.macd ?? 0) / p * 100 : null;
@@ -250,10 +251,19 @@ function resolveIndicatorValue(name, indicators, prices, volumeRatio) {
     case "atrPct":       return indicators.atr && p ? indicators.atr / p * 100 : null;
     case "volume":       return volumeRatio ?? null;
     case "price":        return p;
+    // ── ML model outputs ─────────────────────────────────────────────────────
     case "rfProb":       return null; // set externally via rfPredCache
     case "lstmTrend":    return null; // set externally via lstmPredCache
     case "lstmDirProb":  return null; // set externally
-    default:             return null;
+    // ── Position / exit context (set externally via extra{}) ─────────────────
+    case "unrealizedPct":    return null; // % gain/loss on open position
+    case "heldMinutes":      return null; // minutes position has been open
+    case "heldTicks":        return null; // ticks position has been open
+    case "peakProfitPct":    return null; // highest unrealized % since entry
+    case "drawdownFromPeak": return null; // how far price has fallen from peak (%)
+    case "totalPnl":         return null; // cumulative realized P&L ($)
+    case "positionSize":     return null; // current position size in USD
+    default:                 return null;
   }
 }
 
@@ -285,53 +295,84 @@ function evalGroup(group, indicators, prices, volumeRatio, extra = {}) {
     : results.every(Boolean);
 }
 
-// Evaluate all groups and return a signal
+// Exit action constants — these map to the existing exit trigger system
+const EXIT_ACTIONS = new Set([
+  "TRAILING_TAKE_PROFIT", "TIME_EXIT", "TRAILING_STOP",
+  "SIGNAL_REVERSAL",      "DYNAMIC_EXIT", "POST_BUY_LIMIT",
+  "TAKE_PROFIT",          "STOP_LOSS",
+]);
+
+// Evaluate all groups and return a signal or exit action
 function evalCustomRules(customRules, indicators, prices, volumeRatio, extra = {}) {
   if (!customRules?.enabled || !customRules.groups?.length) return null;
 
-  const signals = [];
+  const signals     = [];  // entry signals (BUY/SELL/HOLD)
+  const exitTriggers = []; // exit actions (TRAILING_TAKE_PROFIT etc.)
+
   for (const group of customRules.groups) {
     if (!group.conditions?.length) continue;
     const passed = evalGroup(group, indicators, prices, volumeRatio, extra);
-    if (passed) signals.push({ action: group.action || "BUY", weight: group.weight || 1, label: group.label });
+    if (!passed) continue;
+
+    const action = group.action || "BUY";
+    if (EXIT_ACTIONS.has(action)) {
+      // This group is an exit rule — collect it separately
+      exitTriggers.push({ action, weight: group.weight || 1, label: group.label, params: group.params || {} });
+    } else {
+      signals.push({ action, weight: group.weight || 1, label: group.label });
+    }
   }
 
-  if (signals.length === 0) return null;
+  // ── Entry signal result ──────────────────────────────────────────────────
+  let entryResult = null;
+  if (signals.length > 0) {
+    let buyWeight = 0, sellWeight = 0;
+    signals.forEach(s => {
+      if (s.action === "BUY")  buyWeight  += s.weight;
+      if (s.action === "SELL") sellWeight += s.weight;
+    });
 
-  // Tally weighted votes
-  let buyWeight = 0, sellWeight = 0;
-  signals.forEach(s => {
-    if (s.action === "BUY")  buyWeight  += s.weight;
-    if (s.action === "SELL") sellWeight += s.weight;
-  });
-
-  const groupLogic = customRules.groupLogic || "and";
-  const totalGroups = customRules.groups.filter(g => g.conditions?.length).length;
-
-  let action = "HOLD";
-  if (groupLogic === "or") {
-    // Any passing group triggers
-    if (buyWeight > 0 && buyWeight >= sellWeight)  action = "BUY";
-    if (sellWeight > 0 && sellWeight > buyWeight) action = "SELL";
-  } else {
-    // AND: majority by weight
+    const groupLogic  = customRules.groupLogic || "and";
     const totalWeight = customRules.groups.reduce((s, g) => s + (g.weight || 1), 0);
-    if (buyWeight  > totalWeight * 0.5) action = "BUY";
-    if (sellWeight > totalWeight * 0.5) action = "SELL";
+    let action = "HOLD";
+    if (groupLogic === "or") {
+      if (buyWeight > 0 && buyWeight >= sellWeight) action = "BUY";
+      if (sellWeight > 0 && sellWeight > buyWeight) action = "SELL";
+    } else {
+      if (buyWeight  > totalWeight * 0.5) action = "BUY";
+      if (sellWeight > totalWeight * 0.5) action = "SELL";
+    }
+
+    const confidence = Math.min(99,
+      Math.round(Math.max(buyWeight, sellWeight) / (buyWeight + sellWeight + 0.01) * 100));
+
+    entryResult = {
+      action,
+      confidence: String(confidence),
+      score:      (buyWeight - sellWeight).toFixed(2),
+      agreeingCount:   signals.length,
+      totalIndicators: customRules.groups.filter(g => g.conditions?.length).length,
+      reasons: signals.map(s => ({ label: `${s.label}: ${s.action}`, vote: s.action === "BUY" ? 1 : -1 })),
+      fromCustomRules: true,
+      exitTriggers,    // pass exit triggers along even in entry result
+    };
   }
 
-  const score = (buyWeight - sellWeight).toFixed(2);
-  const confidence = Math.min(99, Math.round(Math.max(buyWeight, sellWeight) / (buyWeight + sellWeight + 0.01) * 100));
+  // ── Exit-only result (no entry signal but exits fired) ───────────────────
+  if (!entryResult && exitTriggers.length > 0) {
+    return {
+      action: "HOLD",
+      confidence: "0",
+      score: "0",
+      agreeingCount: 0,
+      totalIndicators: 0,
+      reasons: [],
+      fromCustomRules: true,
+      exitTriggers,
+    };
+  }
 
-  return {
-    action,
-    confidence: String(confidence),
-    score,
-    agreeingCount: signals.length,
-    totalIndicators: totalGroups,
-    reasons: signals.map(s => ({ label: `${s.label}: ${s.action}`, vote: s.action === "BUY" ? 1 : -1 })),
-    fromCustomRules: true,
-  };
+  return entryResult;
 }
 
 function generateMeanReversionSignal(indicators, volumeRatio, feePercent) {
@@ -2669,20 +2710,47 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
           const cr   = form.customRules || { enabled: false, groupLogic: "and", groups: [] };
           const setCr = (patch) => set("customRules", { ...cr, ...patch });
           const INDICATORS = [
-            { value: "rsi",          label: "RSI (14)",           unit: "0–100",     hint: "e.g. < 35 for oversold" },
-            { value: "macd",         label: "MACD",               unit: "price",     hint: "e.g. > 0 for bullish crossover" },
-            { value: "macdNorm",     label: "MACD % of price",    unit: "%",         hint: "normalised MACD" },
-            { value: "bollingerPct", label: "Bollinger %B",       unit: "0–1",       hint: "< 0.2 = near lower band" },
-            { value: "sma20dist",    label: "Price vs SMA20 (%)", unit: "%",         hint: "e.g. > 0 = above SMA20" },
-            { value: "sma50dist",    label: "Price vs SMA50 (%)", unit: "%",         hint: "" },
-            { value: "sma99dist",    label: "Price vs SMA99 (%)", unit: "%",         hint: "" },
-            { value: "emaSpread",    label: "EMA12-26 spread (%)", unit: "%",        hint: "> 0 = EMA12 above EMA26" },
-            { value: "atrPct",       label: "ATR % of price",     unit: "%",         hint: "volatility proxy" },
-            { value: "volume",       label: "Volume ratio",        unit: "×avg",     hint: "> 1.2 = above average" },
-            { value: "rfProb",       label: "RF direction P↑",    unit: "0–1",       hint: "> 0.6 = RF bullish" },
-            { value: "lstmDirProb",  label: "LSTM direction P↑",  unit: "0–1",       hint: "> 0.6 = LSTM bullish" },
-            { value: "lstmTrend",    label: "LSTM trend score",   unit: "-1 to +1",  hint: "> 0 = uptrend" },
+            // ── Technical ─────────────────────────────────────────────────────
+            { value: "rsi",           label: "RSI (14)",            unit: "0–100",    hint: "< 35 oversold, > 65 overbought",  group: "Technical" },
+            { value: "macd",          label: "MACD",                unit: "price",    hint: "> 0 bullish crossover",            group: "Technical" },
+            { value: "macdNorm",      label: "MACD % of price",     unit: "%",        hint: "normalised MACD",                  group: "Technical" },
+            { value: "bollingerPct",  label: "Bollinger %B",        unit: "0–1",      hint: "< 0.2 near lower, > 0.8 upper",   group: "Technical" },
+            { value: "sma20dist",     label: "Price vs SMA20 (%)",  unit: "%",        hint: "> 0 = above SMA20",                group: "Technical" },
+            { value: "sma50dist",     label: "Price vs SMA50 (%)",  unit: "%",        hint: "",                                 group: "Technical" },
+            { value: "sma99dist",     label: "Price vs SMA99 (%)",  unit: "%",        hint: "",                                 group: "Technical" },
+            { value: "emaSpread",     label: "EMA12-26 spread (%)", unit: "%",        hint: "> 0 = EMA12 above EMA26",          group: "Technical" },
+            { value: "atrPct",        label: "ATR % of price",      unit: "%",        hint: "> 0.3 = enough volatility",        group: "Technical" },
+            { value: "volume",        label: "Volume ratio",         unit: "×avg",    hint: "> 1.2 = above average volume",     group: "Technical" },
+            // ── ML models ─────────────────────────────────────────────────────
+            { value: "rfProb",        label: "RF direction P↑",     unit: "0–1",      hint: "> 0.6 = RF bullish",               group: "ML" },
+            { value: "lstmDirProb",   label: "LSTM direction P↑",   unit: "0–1",      hint: "> 0.6 = LSTM bullish",             group: "ML" },
+            { value: "lstmTrend",     label: "LSTM trend score",    unit: "-1 to +1", hint: "> 0.1 = uptrend",                  group: "ML" },
+            // ── Position / exit context ────────────────────────────────────────
+            { value: "unrealizedPct",   label: "Unrealized P&L (%)",   unit: "%",    hint: "> 1 = 1% in profit",               group: "Position" },
+            { value: "heldMinutes",     label: "Time held (minutes)",   unit: "min",  hint: "> 30 = held 30+ minutes",          group: "Position" },
+            { value: "heldTicks",       label: "Time held (ticks)",     unit: "ticks",hint: "> 60 = held 60+ ticks",            group: "Position" },
+            { value: "peakProfitPct",   label: "Peak profit (%)",       unit: "%",    hint: "highest unrealised % since entry", group: "Position" },
+            { value: "drawdownFromPeak",label: "Drawdown from peak (%)",unit: "%",    hint: "> 1 = fell 1% from peak",          group: "Position" },
+            { value: "totalPnl",        label: "Total session P&L ($)", unit: "$",    hint: "cumulative realised P&L",          group: "Position" },
+            { value: "signalScore",     label: "Signal score",          unit: "-5/+5",hint: "< 0 = signal reversed",            group: "Position" },
           ];
+
+          const ENTRY_ACTIONS = [
+            { value: "BUY",  label: "BUY",  color: "#10b981", hint: "Open a long position" },
+            { value: "SELL", label: "SELL", color: "#ef4444", hint: "Close / short signal" },
+            { value: "HOLD", label: "HOLD", color: "#94a3b8", hint: "Do nothing" },
+          ];
+          const EXIT_ACTIONS_LIST = [
+            { value: "TAKE_PROFIT",          label: "Take Profit",         color: "#10b981", hint: "Exit at target price (standard TP)" },
+            { value: "TRAILING_TAKE_PROFIT", label: "Trailing Take-Profit",color: "#10b981", hint: "Let profits run, exit on reversal from peak" },
+            { value: "STOP_LOSS",            label: "Stop Loss",           color: "#ef4444", hint: "Exit to limit losses" },
+            { value: "TRAILING_STOP",        label: "Trailing Stop Loss",  color: "#ef4444", hint: "Trail stop from entry price" },
+            { value: "TIME_EXIT",            label: "Time-Based Exit",     color: "#f59e0b", hint: "Exit after holding N minutes" },
+            { value: "SIGNAL_REVERSAL",      label: "Signal Reversal Exit",color: "#f59e0b", hint: "Exit when signal score turns negative" },
+            { value: "DYNAMIC_EXIT",         label: "Dynamic Exit",        color: "#8b5cf6", hint: "Scale TP/SL based on session P&L" },
+            { value: "POST_BUY_LIMIT",       label: "Post-Buy Limit Sell", color: "#6366f1", hint: "Place resting limit sell after BUY fills" },
+          ];
+          const ALL_ACTIONS = [...ENTRY_ACTIONS, ...EXIT_ACTIONS_LIST];
           const OPS = ["<", "<=", ">", ">=", "=", "!="];
           const newId = () => Math.random().toString(36).slice(2, 7);
 
@@ -2763,16 +2831,18 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                           </button>
                         ))}
                         <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>→</span>
-                        {["BUY","SELL","HOLD"].map(a => (
-                          <button key={a} onClick={() => updateGroup(group.id, { action: a })}
-                            style={{ padding: "2px 9px", borderRadius: 4, fontSize: 10, fontWeight: 800,
-                              border: `0.5px solid ${group.action===a ? (a==="BUY"?"#10b981":a==="SELL"?"#ef4444":"#94a3b8") : "var(--color-border-tertiary)"}`,
-                              background: group.action===a ? (a==="BUY"?"#10b98122":a==="SELL"?"#ef444422":"transparent") : "transparent",
-                              color: group.action===a ? (a==="BUY"?"#10b981":a==="SELL"?"#ef4444":"#94a3b8") : "var(--color-text-tertiary)",
-                              cursor: "pointer" }}>
-                            {a}
-                          </button>
-                        ))}
+                        <select value={group.action || "BUY"} onChange={e => updateGroup(group.id, { action: e.target.value })}
+                          style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4,
+                            border: `0.5px solid ${(ALL_ACTIONS.find(a=>a.value===group.action)||ENTRY_ACTIONS[0]).color}44`,
+                            background: "var(--color-background-primary)", cursor: "pointer",
+                            color: (ALL_ACTIONS.find(a=>a.value===group.action)||ENTRY_ACTIONS[0]).color }}>
+                          <optgroup label="Entry signals">
+                            {ENTRY_ACTIONS.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
+                          </optgroup>
+                          <optgroup label="Exit strategies">
+                            {EXIT_ACTIONS_LIST.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
+                          </optgroup>
+                        </select>
                         <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--color-text-secondary)" }}>
                           W:
                           <input type="number" value={group.weight||1} min="1" max="10"
@@ -2796,13 +2866,22 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                             <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", minWidth: 14 }}>
                               {ci === 0 ? "IF" : group.logic.toUpperCase()}
                             </span>
-                            {/* Indicator selector */}
+                            {/* Indicator selector — grouped */}
                             <select value={cond.indicator}
                               onChange={e => updateCond(group.id, cond.id, { indicator: e.target.value })}
+                              title={INDICATORS.find(i=>i.value===cond.indicator)?.hint || ""}
                               style={{ flex: 2, fontSize: 11, padding: "3px 6px", borderRadius: 4,
                                 border: "0.5px solid var(--color-border-secondary)",
                                 background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
-                              {INDICATORS.map(i => <option key={i.value} value={i.value}>{i.label}</option>)}
+                              <optgroup label="Technical">
+                                {INDICATORS.filter(i=>i.group==="Technical").map(i => <option key={i.value} value={i.value}>{i.label}</option>)}
+                              </optgroup>
+                              <optgroup label="ML Models">
+                                {INDICATORS.filter(i=>i.group==="ML").map(i => <option key={i.value} value={i.value}>{i.label}</option>)}
+                              </optgroup>
+                              <optgroup label="Position / Exit">
+                                {INDICATORS.filter(i=>i.group==="Position").map(i => <option key={i.value} value={i.value}>{i.label}</option>)}
+                              </optgroup>
                             </select>
                             {/* Operator */}
                             <select value={cond.op}
@@ -2847,11 +2926,11 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                   {/* Legend */}
                   <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", lineHeight: 1.7,
                     padding: "8px 12px", borderRadius: 7, background: "var(--color-background-secondary)" }}>
-                    <strong>How it works:</strong> Each group evaluates its conditions using AND/OR logic.
-                    Passing groups cast a weighted vote (W) toward their action (BUY/SELL/HOLD).
-                    Groups are then combined using the top-level AND/OR combiner.
-                    W (weight) controls how strongly a group's vote counts vs others.
-                    RF and LSTM indicators are available once the models have warmed up.
+                    <strong>Entry groups</strong> (BUY/SELL/HOLD) cast weighted votes combined via the top-level AND/OR.{" "}
+                    <strong>Exit groups</strong> fire immediately when their conditions pass — no voting, first match wins by weight.{" "}
+                    <strong>Position indicators</strong> (unrealized %, held time, peak profit, drawdown) are only available when a position is open.{" "}
+                    <strong>RF/LSTM</strong> available after warm-up (15 ticks / 80 ticks respectively).{" "}
+                    Hover over an indicator selector to see a hint for typical values.
                   </div>
                 </>
               )}
@@ -3573,13 +3652,56 @@ function CryptoAlgoTrader() {
         },
         {
           id: "g2",
-          label: "Overbought exit",
+          label: "Overbought exit signal",
           logic: "or",
           action: "SELL",
           weight: 2,
           conditions: [
-            { id: "c3", indicator: "rsi",         op: ">",  value: "65", enabled: true },
-            { id: "c4", indicator: "bollingerPct", op: ">",  value: "0.9", enabled: true },
+            { id: "c3", indicator: "rsi",         op: ">", value: "65",  enabled: true },
+            { id: "c4", indicator: "bollingerPct", op: ">", value: "0.9", enabled: true },
+          ],
+        },
+        {
+          id: "g3",
+          label: "Trailing take-profit (1% drawdown from peak)",
+          logic: "and",
+          action: "TRAILING_TAKE_PROFIT",
+          weight: 3,
+          conditions: [
+            { id: "c5", indicator: "peakProfitPct",    op: ">", value: "1.5", enabled: true },
+            { id: "c6", indicator: "drawdownFromPeak",  op: ">", value: "1.0", enabled: true },
+          ],
+        },
+        {
+          id: "g4",
+          label: "Time-based exit (30 min max hold)",
+          logic: "and",
+          action: "TIME_EXIT",
+          weight: 2,
+          conditions: [
+            { id: "c7", indicator: "heldMinutes", op: ">", value: "30", enabled: false },
+          ],
+        },
+        {
+          id: "g5",
+          label: "Signal reversal exit",
+          logic: "and",
+          action: "SIGNAL_REVERSAL",
+          weight: 2,
+          conditions: [
+            { id: "c8", indicator: "signalScore", op: "<", value: "-1", enabled: false },
+            { id: "c9", indicator: "unrealizedPct", op: ">", value: "0.5", enabled: false },
+          ],
+        },
+        {
+          id: "g6",
+          label: "Dynamic exit when session profitable",
+          logic: "and",
+          action: "DYNAMIC_EXIT",
+          weight: 1,
+          conditions: [
+            { id: "c10", indicator: "totalPnl",       op: ">", value: "20", enabled: false },
+            { id: "c11", indicator: "unrealizedPct",  op: ">", value: "1",  enabled: false },
           ],
         },
       ],
@@ -4780,11 +4902,28 @@ function CryptoAlgoTrader() {
       // ── Signal source routing ─────────────────────────────────────────────────
       const src = creds.signalSource || "rules";
 
-      // Extra values for custom rule conditions that need RF/LSTM data
+      // Extra values for custom rule conditions (position context + ML)
+      const pos         = cs.position;
+      const heldMs      = pos ? (tickRef.current - (pos.entryTick || 0)) * (speed || 1500) : 0;
+      const unrealPct   = pos ? (newPrice - pos.price) / pos.price * 100 : null;
+      const peakProfit  = pos ? Math.max(unrealPct || 0, pos._peakPct || 0) : null;
+      // Update peak on position object (mutable ref)
+      if (pos && unrealPct !== null && unrealPct > (pos._peakPct || 0)) pos._peakPct = unrealPct;
+      const drawdown    = pos && peakProfit !== null ? peakProfit - (unrealPct || 0) : null;
+      const totalPnl    = Object.values(stateRef.current).reduce((s, c) => s + (c.pnl || 0), 0);
+
       const ruleExtra = {
-        rfProb:      rfPredCache[coin]?.directionProbability ?? null,
-        lstmTrend:   lstmPredCache[coin]?.trendScore         ?? null,
-        lstmDirProb: lstmPredCache[coin]?.directionProbability ?? null,
+        rfProb:           rfPredCache[coin]?.directionProbability  ?? null,
+        lstmTrend:        lstmPredCache[coin]?.trendScore          ?? null,
+        lstmDirProb:      lstmPredCache[coin]?.directionProbability ?? null,
+        unrealizedPct:    unrealPct,
+        heldMinutes:      heldMs / 60000,
+        heldTicks:        pos ? tickRef.current - (pos.entryTick || 0) : 0,
+        peakProfitPct:    peakProfit,
+        drawdownFromPeak: drawdown,
+        totalPnl,
+        positionSize:     pos ? pos.price * pos.size : 0,
+        signalScore:      0, // updated below after signal is computed
       };
 
       // Custom rule engine — evaluated first if enabled, overrides standard rules
@@ -4844,6 +4983,18 @@ function CryptoAlgoTrader() {
         || (src === "rf"      && rfSignal)
         || (src === "lstm"    && lstmSignal)
         || ruleSignal;
+
+      // Now that signal is defined, update signalScore in ruleExtra and
+      // re-evaluate custom rules to pick up exit triggers that depend on it
+      ruleExtra.signalScore = parseFloat(signal?.score || 0);
+      const customExitSignal = creds.customRules?.enabled && cs.position
+        ? evalCustomRules(creds.customRules, indicators, cs.prices, volumeRatio, ruleExtra)
+        : null;
+      // Merge exit triggers from both evaluations
+      const allCustomExits = [
+        ...(customRuleSignal?.exitTriggers || []),
+        ...(customExitSignal?.exitTriggers  || []),
+      ];
 
       // ── Exit rule helpers ─────────────────────────────────────────────────────
       const exitRule = creds.exitRules?.[coin] || {};
@@ -4988,20 +5139,44 @@ function CryptoAlgoTrader() {
         if (parseFloat(signal.score) <= threshold) hitSignalReversal = true;
       }
 
+      // ── Custom rule exit triggers ──────────────────────────────────────────────
+      const customExits   = allCustomExits;
+      const hitCustomExit = cs.position && customExits.length > 0;
+
+      // Map custom exit actions to their corresponding trigger flags
+      const customExitAction = hitCustomExit
+        ? customExits.sort((a,b) => (b.weight||1) - (a.weight||1))[0].action
+        : null;
+
+      // Named custom exit flags
+      const hitCustomTTP      = customExits.some(e => e.action === "TRAILING_TAKE_PROFIT");
+      const hitCustomTimExit  = customExits.some(e => e.action === "TIME_EXIT");
+      const hitCustomTStop    = customExits.some(e => e.action === "TRAILING_STOP");
+      const hitCustomSigRev   = customExits.some(e => e.action === "SIGNAL_REVERSAL");
+      const hitCustomDynExit  = customExits.some(e => e.action === "DYNAMIC_EXIT");
+      const hitCustomPBLimit  = customExits.some(e => e.action === "POST_BUY_LIMIT");
+      const hitCustomSell     = customExits.some(e => e.action === "SELL" || e.action === "STOP_LOSS");
+
       // ── Combine all exit triggers ─────────────────────────────────────────────
       const shouldSell = cs.position && (
         hitTakeProfit || hitTrailingTakeProfit || hitStopLoss ||
         hitTrailingStop || hitATRTP || hitATRStop ||
-        hitTimeExit || hitSignalReversal
+        hitTimeExit || hitSignalReversal ||
+        hitCustomTTP || hitCustomTimExit || hitCustomTStop ||
+        hitCustomSigRev || hitCustomDynExit || hitCustomPBLimit || hitCustomSell
       );
-      const sellReason = hitTrailingTakeProfit ? "TRAILING_TAKE_PROFIT"
-        : hitTakeProfit     ? "TAKE_PROFIT"
-        : hitStopLoss       ? "STOP_LOSS"
-        : hitTrailingStop   ? "TRAILING_STOP"
-        : hitATRTP          ? "ATR_TAKE_PROFIT"
-        : hitATRStop        ? "ATR_STOP_LOSS"
-        : hitTimeExit       ? "TIME_EXIT"
-        : hitSignalReversal ? "SIGNAL_REVERSAL"
+      const sellReason = hitTrailingTakeProfit        ? "TRAILING_TAKE_PROFIT"
+        : hitCustomTTP                                ? "RULE_TRAILING_TAKE_PROFIT"
+        : hitTakeProfit                               ? "TAKE_PROFIT"
+        : hitCustomSell                               ? "RULE_STOP_LOSS"
+        : hitStopLoss                                 ? "STOP_LOSS"
+        : hitTrailingStop || hitCustomTStop           ? "TRAILING_STOP"
+        : hitATRTP                                    ? "ATR_TAKE_PROFIT"
+        : hitATRStop                                  ? "ATR_STOP_LOSS"
+        : hitTimeExit  || hitCustomTimExit            ? "TIME_EXIT"
+        : hitSignalReversal || hitCustomSigRev        ? "SIGNAL_REVERSAL"
+        : hitCustomDynExit                            ? "RULE_DYNAMIC_EXIT"
+        : hitCustomPBLimit                            ? "RULE_POST_BUY_LIMIT"
         : null;
 
       // ── Warmup check (ref-based — never stale) ───────────────────────────────
