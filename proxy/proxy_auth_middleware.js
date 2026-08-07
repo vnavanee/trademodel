@@ -127,12 +127,49 @@ async function requireAuth(req, res) {
     const payload = await getClerk().verifyToken(token);
     const userId  = payload.sub;
 
+    // If Supabase is not configured, skip DB entirely
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+      console.warn("[auth] Supabase not configured — returning free plan");
+      return { userId, plan: "free" };
+    }
+
     // Try to find user row in Supabase
-    const { data: user, error: fetchErr } = await getSupabase()
-      .from("users")
-      .select("plan, is_active, email")
-      .eq("id", userId)
-      .single();
+    let user = null, fetchErr = null;
+    try {
+      const result = await getSupabase()
+        .from("users")
+        .select("plan, is_active, email")
+        .eq("id", userId)
+        .single();
+      user     = result.data;
+      fetchErr = result.error;
+    } catch (e) {
+      // Network-level failure — Supabase may be paused or unreachable
+      const isPaused = e.message?.includes("fetch") || e.message?.includes("ECONNREFUSED")
+        || e.message?.includes("network") || e.message?.includes("timeout");
+      if (isPaused) {
+        console.error("[auth] Supabase unreachable:", e.message, "— visit supabase.com to resume project");
+        res.status(503).json({ error: "Service temporarily unavailable. Please try again shortly." });
+        return null;
+      }
+      throw e;
+    }
+
+    // Supabase paused returns a specific error structure
+    if (fetchErr && (
+      fetchErr.message?.includes("Project paused") ||
+      fetchErr.message?.includes("503") ||
+      fetchErr.code === "57P03" ||
+      fetchErr.message?.includes("upstream connect error")
+    )) {
+      console.error("[auth] Supabase paused:", fetchErr.code, fetchErr.message);
+      res.status(503).json({ error: "Service temporarily unavailable. Please try again shortly." });
+      return null;
+    }
+
+    if (fetchErr && fetchErr.code !== "PGRST116") {
+      console.error("[auth] DB fetch error:", fetchErr.code, fetchErr.message);
+    }
 
     // If user row doesn't exist yet — create it automatically with plan:"free"
     if (!user || fetchErr?.code === "PGRST116") {
@@ -160,30 +197,45 @@ async function requireAuth(req, res) {
         .single();
 
       if (insertErr) {
-        // Log the full error detail so Cloud Run logs show exactly what failed
-        console.error("[auth] upsert error:", JSON.stringify(insertErr));
-        // Still try to proceed — maybe the row was created by a concurrent request
-        // Do one final read before giving up
-        const { data: retry } = await sb
-          .from("users").select("plan, is_active").eq("id", userId).single();
-        if (retry) {
-          console.log("[auth] row found on retry — concurrent insert race, continuing");
-          return { userId, plan: retry.plan || "free" };
+        console.error("[auth] upsert error code:", insertErr.code, "msg:", insertErr.message, "details:", insertErr.details, "hint:", insertErr.hint);
+
+        // Common error codes and their fixes
+        const errGuide = {
+          "42P01": "The 'users' table does not exist — run supabase_schema.sql in the Supabase SQL Editor",
+          "42501": "Permission denied — SUPABASE_SERVICE_KEY must be the service_role key, not the anon key",
+          "23505": "Duplicate key — row already exists (concurrent insert). This is safe to ignore.",
+          "PGRST301": "JWT error — SUPABASE_SERVICE_KEY may be invalid or expired",
+        };
+        const hint = errGuide[insertErr.code] || "Check SUPABASE_URL and SUPABASE_SERVICE_KEY env vars on Cloud Run";
+
+        // Final retry — row may have been created by a concurrent request
+        try {
+          const { data: retry } = await sb
+            .from("users").select("plan, is_active").eq("id", userId).single();
+          if (retry) {
+            console.log("[auth] row found on retry after insert error — continuing");
+            return { userId, plan: retry.plan || "free" };
+          }
+        } catch (_) {}
+
+        // If it's a duplicate key error (23505), the row exists — try reading it
+        if (insertErr.code === "23505") {
+          const { data: existing } = await sb
+            .from("users").select("plan, is_active").eq("id", userId).maybeSingle();
+          if (existing) return { userId, plan: existing.plan || "free" };
         }
-        res.status(500).json({
-          error: "Failed to initialise user account",
-          detail: insertErr.message,
-          hint: "Check SUPABASE_SERVICE_KEY is the service_role key (not anon key), and the users table exists",
-        });
+
+        res.status(500).json({ error: "Account setup failed. Please try again or contact support." });
         return null;
       }
 
-      console.log(`[auth] auto-created user ${userId} plan=free`);
+      console.log(`[auth] auto-created user ${userId} email=${email} plan=free`);
       return { userId, plan: inserted?.plan || "free" };
     }
 
     if (!user.is_active) {
-      res.status(403).json({ error: "Account has been deactivated — contact support" });
+      console.warn("[auth] inactive account:", userId);
+      res.status(403).json({ error: "Account unavailable. Please contact support." });
       return null;
     }
 
@@ -191,7 +243,7 @@ async function requireAuth(req, res) {
 
   } catch (e) {
     console.error("[auth] token verification failed:", e.message);
-    res.status(401).json({ error: "Invalid or expired token" });
+    res.status(401).json({ error: "Authentication failed. Please sign in again." });
     return null;
   }
 }
@@ -223,8 +275,8 @@ async function handleGetSettings(req, res) {
     .single();
 
   if (error && error.code !== "PGRST116") { // PGRST116 = no rows found
-    console.error("[settings/get] db error:", error);
-    return res.status(500).json({ error: "Failed to load settings" });
+    console.error("[settings/get] db error:", error.code, error.message);
+    return res.status(500).json({ error: "Unable to load settings. Please try again." });
   }
 
   if (!data) {
@@ -275,8 +327,8 @@ async function handlePutSettings(req, res) {
     .upsert({ user_id: auth.userId, creds: encrypted }, { onConflict: "user_id" });
 
   if (error) {
-    console.error("[settings/put] db error:", error);
-    return res.status(500).json({ error: "Failed to save settings" });
+    console.error("[settings/put] db error:", error.code, error.message);
+    return res.status(500).json({ error: "Unable to save settings. Please try again." });
   }
 
   // Audit log
@@ -326,7 +378,7 @@ async function handlePostTransaction(req, res) {
 
   if (error) {
     console.error("[transactions/post] db error:", error);
-    return res.status(500).json({ error: "Failed to save transaction" });
+    return res.status(500).json({ error: "Unable to save transaction. Please try again." });
   }
 
   return res.status(200).json({ ok: true });
@@ -357,7 +409,7 @@ async function handleGetTransactions(req, res) {
   const { data, count, error } = await query;
   if (error) {
     console.error("[transactions/get] db error:", error);
-    return res.status(500).json({ error: "Failed to load transactions" });
+    return res.status(500).json({ error: "Unable to load transactions. Please try again." });
   }
 
   return res.status(200).json({ transactions: data, total: count, limit, offset });
@@ -428,30 +480,62 @@ async function handleSubscribe(req, res) {
   const auth = await requireAuth(req, res);
   if (!auth) return;
 
-  let body;
-  try { body = await readBody(req); } catch (e) {
-    return res.status(400).json({ error: "Invalid JSON" });
+  // Guard: check Stripe is configured before doing anything
+  if (!process.env.STRIPE_SECRET_KEY) {
+    return res.status(500).json({
+      error: "Stripe not configured — set STRIPE_SECRET_KEY on Cloud Run",
+    });
   }
 
+  let body;
+  try { body = await readBody(req); } catch (e) {
+    return res.status(400).json({ error: "Invalid request format. Please try again." });
+  }
+
+  console.log("[subscribe] body:", JSON.stringify(body));
+
   const { plan, successUrl, cancelUrl } = body;
+  if (!plan) return res.status(400).json({ error: "Missing plan in request body" });
+
   const PRICE_IDS = {
     pro:    process.env.STRIPE_PRICE_PRO,
     pro_ai: process.env.STRIPE_PRICE_PRO_AI,
   };
   const priceId = PRICE_IDS[plan];
-  if (!priceId) return res.status(400).json({ error: `Unknown plan: ${plan}` });
+  if (!priceId) {
+    return res.status(400).json({
+      error: `Unknown plan "${plan}" or price ID not set. Set STRIPE_PRICE_PRO / STRIPE_PRICE_PRO_AI on Cloud Run.`,
+    });
+  }
 
-  const session = await stripe.checkout.sessions.create({
-    mode: "subscription",
-    payment_method_types: ["card"],
-    line_items: [{ price: priceId, quantity: 1 }],
-    success_url: successUrl || "https://yourapp.netlify.app/?upgraded=1",
-    cancel_url:  cancelUrl  || "https://yourapp.netlify.app/",
-    metadata: { clerk_user_id: auth.userId },
-    subscription_data: { metadata: { clerk_user_id: auth.userId } },
-  });
+  let stripe;
+  try {
+    stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+  } catch (e) {
+    return res.status(500).json({
+      error: `Stripe package not available: ${e.message}. Run: npm install stripe in coinbase-proxy/`,
+    });
+  }
 
-  return res.status(200).json({ url: session.url });
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      payment_method_types: ["card"],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: successUrl || `${req.headers.origin || "https://yourapp.netlify.app"}/?upgraded=1`,
+      cancel_url:  cancelUrl  || `${req.headers.origin || "https://yourapp.netlify.app"}/`,
+      metadata: { clerk_user_id: auth.userId },
+      subscription_data: { metadata: { clerk_user_id: auth.userId } },
+    });
+    console.log(`[subscribe] created session ${session.id} for ${auth.userId} plan=${plan}`);
+    return res.status(200).json({ url: session.url });
+  } catch (e) {
+    console.error("[subscribe] Stripe error:", e.message);
+    return res.status(502).json({
+      error: `Stripe error: ${e.message}`,
+      hint: "Check STRIPE_SECRET_KEY is a valid live/test secret key (sk_live_... or sk_test_...)",
+    });
+  }
 }
 
 // ─── NEW ROUTE: POST /users (Clerk webhook — user.created) ───────────────────
@@ -514,3 +598,4 @@ module.exports = {
   handleSubscribe, handleStripeWebhook, handleUserCreated,
   encryptCreds, decryptCreds,
 };
+

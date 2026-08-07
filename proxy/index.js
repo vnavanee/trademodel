@@ -16,8 +16,9 @@ const NEWSDATA_KEY  = "pub_7e39169f4e394355a99f1f06ca08b392";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin":  "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Accept",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization, X-Requested-With",
+  "Access-Control-Max-Age": "86400",
   "Content-Type": "application/json",
 };
 

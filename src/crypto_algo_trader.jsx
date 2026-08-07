@@ -221,6 +221,56 @@ function calcATR(prices, period = 14) {
   return trueRanges.reduce((a, b) => a + b, 0) / period;
 }
 
+// ─── Multi-Timeframe Price Buffers ───────────────────────────────────────────
+// Maintains downsampled price buffers at fixed intervals regardless of tick speed.
+// Each buffer stores up to 200 candle closes so we can compute SMAs on any TF.
+
+const MTF_INTERVALS = {
+  "1m":  60_000,
+  "5m":  300_000,
+  "15m": 900_000,
+  "30m": 1_800_000,
+  "1h":  3_600_000,
+};
+const MTF_MAX = 200; // max prices per buffer
+
+// Initialise MTF buffers for a coin (called when stateRef is set up)
+function initMTFBuffers() {
+  const bufs = {};
+  for (const tf of Object.keys(MTF_INTERVALS)) {
+    bufs[tf] = { prices: [], lastSampleAt: 0 };
+  }
+  return bufs;
+}
+
+// Called each tick — adds a new price to whichever TF buffers are due
+function updateMTFBuffers(mtf, price, now = Date.now()) {
+  for (const [tf, intervalMs] of Object.entries(MTF_INTERVALS)) {
+    const buf = mtf[tf];
+    if (now - buf.lastSampleAt >= intervalMs) {
+      buf.prices.push(price);
+      if (buf.prices.length > MTF_MAX) buf.prices.shift();
+      buf.lastSampleAt = now;
+    }
+  }
+}
+
+// Compute MTF SMAs for a coin's buffers
+function calcMTFIndicators(mtf) {
+  const out = {};
+  for (const tf of Object.keys(MTF_INTERVALS)) {
+    const prices = mtf[tf]?.prices || [];
+    out[`sma20_${tf}`] = calcSMA(prices, 20);
+    out[`sma50_${tf}`] = calcSMA(prices, 50);
+    out[`sma99_${tf}`] = calcSMA(prices, 99);
+    out[`ema12_${tf}`] = calcEMA(prices, 12);
+    out[`ema26_${tf}`] = calcEMA(prices, 26);
+    out[`rsi_${tf}`]   = prices.length >= 14 ? calcRSI(prices, 14) : null;
+    out[`count_${tf}`] = prices.length;  // how many samples collected
+  }
+  return out;
+}
+
 // ─── Mean Reversion Signal ───────────────────────────────────────────────────
 // Generates BUY when price is oversold/below bands, SELL when overbought/above bands
 // Opposite of momentum — buys dips and sells rips in ranging markets
@@ -253,17 +303,30 @@ function resolveIndicatorValue(name, indicators, prices, volumeRatio) {
     case "price":        return p;
     // ── ML model outputs ─────────────────────────────────────────────────────
     case "rfProb":       return null; // set externally via rfPredCache
-    case "lstmTrend":    return null; // set externally via lstmPredCache
-    case "lstmDirProb":  return null; // set externally
-    // ── Position / exit context (set externally via extra{}) ─────────────────
-    case "unrealizedPct":    return null; // % gain/loss on open position
-    case "heldMinutes":      return null; // minutes position has been open
-    case "heldTicks":        return null; // ticks position has been open
-    case "peakProfitPct":    return null; // highest unrealized % since entry
-    case "drawdownFromPeak": return null; // how far price has fallen from peak (%)
-    case "totalPnl":         return null; // cumulative realized P&L ($)
-    case "positionSize":     return null; // current position size in USD
-    default:                 return null;
+    case "lstmTrend":    return null;
+    case "lstmDirProb":  return null;
+    // ── Position / exit context (set externally via extra{}) ────────────────
+    case "unrealizedPct":    return null;
+    case "heldMinutes":      return null;
+    case "heldTicks":        return null;
+    case "peakProfitPct":    return null;
+    case "drawdownFromPeak": return null;
+    case "totalPnl":         return null;
+    case "positionSize":     return null;
+    // ── Multi-timeframe SMAs/EMAs/RSI — pre-computed in calcMTFIndicators ────
+    // Format: sma20_1m, sma50_5m, ema12_15m, rsi_1m etc.
+    // Returns % distance from current price (positive = price above SMA)
+    // RSI returns raw 0–100 value
+    default: {
+      const mtfMatch = name.match(/^(sma20|sma50|sma99|ema12|ema26|rsi)_(1m|5m|15m|30m|1h)$/);
+      if (mtfMatch) {
+        const val = indicators[name];
+        if (val === null || val === undefined) return null;
+        if (name.startsWith('rsi_')) return val;
+        return p > 0 ? (p - val) / val * 100 : null;
+      }
+      return null;
+    }
   }
 }
 
@@ -285,14 +348,81 @@ function evalCondition(condition, indicators, prices, volumeRatio, extra = {}) {
   }
 }
 
+// ── Custom logic expression parser ───────────────────────────────────────────
+// Parses expressions like "(1 AND 2) OR (3 AND 4)" where numbers are row indices.
+// Supports: AND, OR, NOT, parentheses, 1-based row numbers.
+function parseLogicExpr(expr, rowResults) {
+  // Tokenise: numbers, AND, OR, NOT, ( )
+  const tokens = expr.toUpperCase()
+    .replace(/\(/g, " ( ").replace(/\)/g, " ) ")
+    .trim().split(/\s+/).filter(Boolean);
+
+  let pos = 0;
+
+  function peek() { return tokens[pos]; }
+  function consume() { return tokens[pos++]; }
+
+  function parseExpr() { return parseOr(); }
+
+  function parseOr() {
+    let left = parseAnd();
+    while (peek() === "OR") { consume(); left = left || parseAnd(); }
+    return left;
+  }
+
+  function parseAnd() {
+    let left = parseNot();
+    while (peek() === "AND") { consume(); left = left && parseNot(); }
+    return left;
+  }
+
+  function parseNot() {
+    if (peek() === "NOT") { consume(); return !parsePrimary(); }
+    return parsePrimary();
+  }
+
+  function parsePrimary() {
+    const t = peek();
+    if (t === "(") {
+      consume(); // (
+      const val = parseExpr();
+      consume(); // )
+      return val;
+    }
+    if (/^\d+$/.test(t)) {
+      consume();
+      const idx = parseInt(t) - 1; // 1-based → 0-based
+      return idx >= 0 && idx < rowResults.length ? rowResults[idx] : false;
+    }
+    consume(); // skip unknown token
+    return false;
+  }
+
+  try { return parseExpr(); } catch { return false; }
+}
+
 // Evaluate a group of conditions
+// If group.customLogic is set (e.g. "(1 AND 2) OR (3 AND 4)"), use the parser.
+// Otherwise fall back to sequential AND/OR per row for backward compatibility.
 function evalGroup(group, indicators, prices, volumeRatio, extra = {}) {
-  const enabled = group.conditions.filter(c => c.enabled !== false);
+  const all     = group.conditions || [];
+  const enabled = all.filter(c => c.enabled !== false);
   if (enabled.length === 0) return false;
-  const results = enabled.map(c => evalCondition(c, indicators, prices, volumeRatio, extra));
-  return group.logic === "or"
-    ? results.some(Boolean)
-    : results.every(Boolean);
+
+  // Evaluate every enabled condition to get per-row boolean results
+  const rowResults = enabled.map(c => evalCondition(c, indicators, prices, volumeRatio, extra));
+
+  // Custom logic expression (e.g. "(1 AND 2) OR (3 AND 4)")
+  const expr = (group.customLogic || "").trim();
+  if (expr) return parseLogicExpr(expr, rowResults);
+
+  // Fallback: sequential per-row combiner (backward compat)
+  let result = rowResults[0];
+  for (let i = 1; i < rowResults.length; i++) {
+    const combiner = enabled[i].combiner || group.logic || "and";
+    result = combiner === "or" ? result || rowResults[i] : result && rowResults[i];
+  }
+  return result;
 }
 
 // Exit action constants — these map to the existing exit trigger system
@@ -1413,7 +1543,8 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
   };
   const [form, setForm] = useState({
     provider:      creds.provider || "coinbase",
-    tradeSizeUSD:  creds.tradeSizeUSD  || "50",
+    tradeSizeUSD:   creds.tradeSizeUSD   || "50",
+    balanceBuffer:  creds.balanceBuffer  || "0.50",
     minConfidence: creds.minConfidence || "60",
     feePercent:    creds.feePercent    || "0.1",
     enabledCoins:  creds.enabledCoins || ["BTC"],
@@ -1769,9 +1900,28 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
               <label style={{ fontSize: 12 }}>
-                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Trade size (USD)</div>
+                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>
+                  Starting trade size (USD)
+                  <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", display: "block", marginTop: 1 }}>
+                    Initial amount — compounds with P&L during session
+                  </span>
+                </div>
                 <input type="number" value={form.tradeSizeUSD} onChange={e => set("tradeSizeUSD", e.target.value)}
-                  min="1" max="10000" style={{ width: "100%", boxSizing: "border-box" }} />
+                  min="1" max="100000" style={{ width: "100%", boxSizing: "border-box" }} />
+              </label>
+              <label style={{ fontSize: 12 }}>
+                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>
+                  Balance buffer ($)
+                  <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", display: "block", marginTop: 1 }}>
+                    Deducted from live balance before trading
+                  </span>
+                </div>
+                <input type="number" value={form.balanceBuffer} onChange={e => set("balanceBuffer", e.target.value)}
+                  min="0" max="100" step="0.01" style={{ width: "100%", boxSizing: "border-box" }} />
+                <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>
+                  e.g. $0.50 — prevents "insufficient funds" errors from rounding.
+                  Live balance $5,000.98 → trades with ${(5000.98 - parseFloat(form.balanceBuffer || 0.5)).toFixed(2)}
+                </div>
               </label>
               <label style={{ fontSize: 12 }}>
                 <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Min confidence (%)</div>
@@ -1972,6 +2122,7 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                   { value: "rf",       icon: "🌲", label: "Random Forest",  desc: "ML classifier on 10 indicators. Available after 15 ticks. Fast and robust." },
                   { value: "lstm",     icon: "🧠", label: "LSTM",           desc: "Sequence model predicting 5 ticks ahead. Available after 80 ticks. Better at patterns." },
                   { value: "rf+lstm",  icon: "🔬", label: "RF + LSTM",      desc: "Average both models. More conservative — needs consensus to signal." },
+                  { value: "rl",       icon: "🎮", label: "Reinforcement Learning", desc: "Q-learning agent that learns from its own trades. Improves over time. Needs 20+ trades to become reliable." },
                   { value: "deepseek", icon: "🤖", label: "DeepSeek Agent", desc: "LLM reasoning over all signals. Most flexible. Requires Agent Mode ON and API key." },
                 ].map(s => (
                   <div key={s.value} onClick={() => set("signalSource", s.value)}
@@ -1989,6 +2140,12 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
               {(form.signalSource === "rf" || form.signalSource === "rf+lstm") && (
                 <div style={{ marginTop: 8, fontSize: 10, padding: "6px 10px", borderRadius: 6, background: "#fef3c711", border: "0.5px solid #f59e0b", color: "#92400e" }}>
                   RF uses current indicator snapshot — signals BUY when P(up) {">"} 58%, SELL when P(up) {"<"} 42%. Works immediately from tick 15.
+                </div>
+              )}
+              {form.signalSource === "rl" && (
+                <div style={{ marginTop: 8, fontSize: 10, padding: "6px 10px", borderRadius: 6, background: "#6366f111", border: "0.5px solid #6366f1", color: "#4338ca" }}>
+                  RL starts with random exploration (ε=0.4) and learns from trade rewards. Needs {RL_MIN_EPISODES}+ completed trades before predictions are reliable.
+                  The longer you run, the smarter it gets. Q-values for each state are shown in the signal log.
                 </div>
               )}
               {(form.signalSource === "lstm" || form.signalSource === "rf+lstm") && (
@@ -2587,23 +2744,39 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 10 }}>
                 {[
-                  { ms: 500,   label: "0.5s" },
-                  { ms: 1000,  label: "1s" },
-                  { ms: 1500,  label: "1.5s" },
-                  { ms: 3000,  label: "3s" },
-                  { ms: 5000,  label: "5s" },
+                  { ms: 500,        label: "0.5s",  group: "Seconds" },
+                  { ms: 1000,       label: "1s",    group: "Seconds" },
+                  { ms: 1500,       label: "1.5s",  group: "Seconds" },
+                  { ms: 3000,       label: "3s",    group: "Seconds" },
+                  { ms: 5000,       label: "5s",    group: "Seconds" },
+                  { ms: 10000,      label: "10s",   group: "Seconds" },
+                  { ms: 30000,      label: "30s",   group: "Seconds" },
+                  { ms: 60000,      label: "1 min", group: "Minutes" },
+                  { ms: 300000,     label: "5 min", group: "Minutes" },
+                  { ms: 900000,     label: "15 min",group: "Minutes" },
+                  { ms: 1800000,    label: "30 min",group: "Minutes" },
+                  { ms: 3600000,    label: "1 hr",  group: "Minutes" },
+                  { ms: 14400000,   label: "4 hr",  group: "Hours"   },
+                  { ms: 86400000,   label: "1 day", group: "Hours"   },
                 ].map(t => (
                   <div key={t.ms} onClick={() => set("tickIntervalMs", t.ms)}
-                    style={{ padding: "8px", borderRadius: 7, cursor: "pointer", textAlign: "center",
-                      border: `0.5px solid ${form.tickIntervalMs === t.ms ? "#6366f1" : "var(--color-border-tertiary)"}`,
+                    style={{ padding: "6px 4px", borderRadius: 7, cursor: "pointer", textAlign: "center",
+                      border: `0.5px solid ${form.tickIntervalMs === t.ms ? "#6366f1" : t.group === "Minutes" ? "#6366f122" : t.group === "Hours" ? "#10b98122" : "var(--color-border-tertiary)"}`,
                       background: form.tickIntervalMs === t.ms ? "#6366f112" : "var(--color-background-secondary)" }}>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: form.tickIntervalMs === t.ms ? "#6366f1" : "var(--color-text-primary)" }}>{t.label}</div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: form.tickIntervalMs === t.ms ? "#6366f1" : t.group === "Minutes" ? "#6366f180" : t.group === "Hours" ? "#10b98180" : "var(--color-text-primary)" }}>{t.label}</div>
                   </div>
                 ))}
               </div>
               <div style={{ fontSize: 11, padding: "8px 12px", borderRadius: 7, background: "var(--color-background-primary)", color: "var(--color-text-secondary)" }}>
-                Faster ticks (0.5s) react quicker but use more API calls / CPU. Slower ticks (5s) are gentler but less responsive.
-                This setting changes what a "20-tick SMA" means in real time — see below.
+                <strong>Seconds</strong> — reactive, high CPU. <strong>Minutes</strong> — suitable for swing trading, low frequency.
+                <strong>Hours/Days</strong> — long-term position trading. WS prices still update in real time — the interval controls signal evaluation frequency only.
+                {form.tickIntervalMs >= 60000 && (
+                  <span style={{ color: "#f59e0b", display: "block", marginTop: 4 }}>
+                    ⚠ At {form.tickIntervalMs >= 3600000 ? `${form.tickIntervalMs/3600000}hr` : `${form.tickIntervalMs/60000}min`} intervals,
+                    a "20-tick SMA" spans {((20 * form.tickIntervalMs) / 60000).toFixed(0)} minutes.
+                    Consider increasing indicator periods to match your timeframe.
+                  </span>
+                )}
               </div>
             </div>
 
@@ -2715,10 +2888,29 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
             { value: "macd",          label: "MACD",                unit: "price",    hint: "> 0 bullish crossover",            group: "Technical" },
             { value: "macdNorm",      label: "MACD % of price",     unit: "%",        hint: "normalised MACD",                  group: "Technical" },
             { value: "bollingerPct",  label: "Bollinger %B",        unit: "0–1",      hint: "< 0.2 near lower, > 0.8 upper",   group: "Technical" },
-            { value: "sma20dist",     label: "Price vs SMA20 (%)",  unit: "%",        hint: "> 0 = above SMA20",                group: "Technical" },
-            { value: "sma50dist",     label: "Price vs SMA50 (%)",  unit: "%",        hint: "",                                 group: "Technical" },
-            { value: "sma99dist",     label: "Price vs SMA99 (%)",  unit: "%",        hint: "",                                 group: "Technical" },
-            { value: "emaSpread",     label: "EMA12-26 spread (%)", unit: "%",        hint: "> 0 = EMA12 above EMA26",          group: "Technical" },
+            { value: "sma20dist",     label: "Price vs SMA20 (%)",      unit: "%",   hint: "> 0 = above SMA20 (tick interval)", group: "Technical" },
+            { value: "sma50dist",     label: "Price vs SMA50 (%)",      unit: "%",   hint: "> 0 = above SMA50",                 group: "Technical" },
+            { value: "sma99dist",     label: "Price vs SMA99 (%)",      unit: "%",   hint: "",                                  group: "Technical" },
+            { value: "emaSpread",     label: "EMA12-26 spread (%)",     unit: "%",   hint: "> 0 = EMA12 above EMA26",           group: "Technical" },
+            // ── Multi-timeframe — price % distance from fixed-interval SMA ────
+            { value: "sma20_1m",  label: "Price vs SMA20 (1min)",   unit: "%",   hint: "> 0 = above 1-min SMA20",           group: "Multi-TF" },
+            { value: "sma50_1m",  label: "Price vs SMA50 (1min)",   unit: "%",   hint: "> 0 = above 1-min SMA50",           group: "Multi-TF" },
+            { value: "sma20_5m",  label: "Price vs SMA20 (5min)",   unit: "%",   hint: "> 0 = above 5-min SMA20",           group: "Multi-TF" },
+            { value: "sma50_5m",  label: "Price vs SMA50 (5min)",   unit: "%",   hint: "> 0 = above 5-min SMA50",           group: "Multi-TF" },
+            { value: "sma99_5m",  label: "Price vs SMA99 (5min)",   unit: "%",   hint: "> 0 = above 5-min SMA99",           group: "Multi-TF" },
+            { value: "sma20_15m", label: "Price vs SMA20 (15min)",  unit: "%",   hint: "> 0 = above 15-min SMA20",          group: "Multi-TF" },
+            { value: "sma50_15m", label: "Price vs SMA50 (15min)",  unit: "%",   hint: "> 0 = above 15-min SMA50",          group: "Multi-TF" },
+            { value: "sma20_30m", label: "Price vs SMA20 (30min)",  unit: "%",   hint: "> 0 = above 30-min SMA20",          group: "Multi-TF" },
+            { value: "sma50_30m", label: "Price vs SMA50 (30min)",  unit: "%",   hint: "> 0 = above 30-min SMA50",          group: "Multi-TF" },
+            { value: "sma20_1h",  label: "Price vs SMA20 (1hr)",    unit: "%",   hint: "> 0 = above 1-hr SMA20",            group: "Multi-TF" },
+            { value: "sma50_1h",  label: "Price vs SMA50 (1hr)",    unit: "%",   hint: "> 0 = above 1-hr SMA50",            group: "Multi-TF" },
+            { value: "ema12_1m",  label: "EMA12 (1min)",            unit: "%",   hint: "% distance from current price",      group: "Multi-TF" },
+            { value: "ema26_1m",  label: "EMA26 (1min)",            unit: "%",   hint: "% distance from current price",      group: "Multi-TF" },
+            { value: "ema12_5m",  label: "EMA12 (5min)",            unit: "%",   hint: "% distance from current price",      group: "Multi-TF" },
+            { value: "ema26_5m",  label: "EMA26 (5min)",            unit: "%",   hint: "% distance from current price",      group: "Multi-TF" },
+            { value: "rsi_1m",    label: "RSI (1min)",              unit: "0–100",hint: "< 35 oversold on 1-min chart",      group: "Multi-TF" },
+            { value: "rsi_5m",    label: "RSI (5min)",              unit: "0–100",hint: "< 35 oversold on 5-min chart",      group: "Multi-TF" },
+            { value: "rsi_15m",   label: "RSI (15min)",             unit: "0–100",hint: "< 35 oversold on 15-min chart",     group: "Multi-TF" },
             { value: "atrPct",        label: "ATR % of price",      unit: "%",        hint: "> 0.3 = enough volatility",        group: "Technical" },
             { value: "volume",        label: "Volume ratio",         unit: "×avg",    hint: "> 1.2 = above average volume",     group: "Technical" },
             // ── ML models ─────────────────────────────────────────────────────
@@ -2757,16 +2949,19 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
           const addGroup = () => setCr({ groups: [...(cr.groups||[]), {
             id: newId(), label: `Rule ${(cr.groups||[]).length + 1}`,
             logic: "and", action: "BUY", weight: 1,
-            conditions: [{ id: newId(), indicator: "rsi", op: "<", value: "35", enabled: true }],
+            conditions: [{ id: newId(), indicator: "rsi", op: "<", value: "35", enabled: true, combiner: "and" }],
           }]});
 
           const updateGroup = (gid, patch) => setCr({ groups: cr.groups.map(g => g.id===gid ? { ...g, ...patch } : g) });
           const removeGroup = (gid) => setCr({ groups: cr.groups.filter(g => g.id !== gid) });
 
-          const addCond = (gid) => updateGroup(gid, {
-            conditions: [...cr.groups.find(g=>g.id===gid).conditions,
-              { id: newId(), indicator: "rsi", op: "<", value: "35", enabled: true }]
-          });
+          const addCond = (gid) => {
+            const grp = cr.groups.find(g => g.id === gid);
+            updateGroup(gid, {
+              conditions: [...grp.conditions,
+                { id: newId(), indicator: "rsi", op: "<", value: "35", enabled: true, combiner: "and" }]
+            });
+          };
           const updateCond = (gid, cid, patch) => updateGroup(gid, {
             conditions: cr.groups.find(g=>g.id===gid).conditions.map(c => c.id===cid ? { ...c, ...patch } : c)
           });
@@ -2821,16 +3016,7 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                             border: "none", borderBottom: "0.5px solid var(--color-border-tertiary)",
                             color: "var(--color-text-primary)", padding: "2px 4px", outline: "none" }} />
                         <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>conditions:</span>
-                        {["and","or"].map(l => (
-                          <button key={l} onClick={() => updateGroup(group.id, { logic: l })}
-                            style={{ padding: "2px 9px", borderRadius: 4, fontSize: 10, fontWeight: 700,
-                              border: `0.5px solid ${group.logic===l ? "#6366f1" : "var(--color-border-tertiary)"}`,
-                              background: group.logic===l ? "#6366f122" : "transparent",
-                              color: group.logic===l ? "#6366f1" : "var(--color-text-secondary)", cursor: "pointer" }}>
-                            {l.toUpperCase()}
-                          </button>
-                        ))}
-                        <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>→</span>
+                        <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>→</span>
                         <select value={group.action || "BUY"} onChange={e => updateGroup(group.id, { action: e.target.value })}
                           style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4,
                             border: `0.5px solid ${(ALL_ACTIONS.find(a=>a.value===group.action)||ENTRY_ACTIONS[0]).color}44`,
@@ -2857,14 +3043,21 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
 
                       {/* Conditions */}
                       {group.conditions.map((cond, ci) => {
-                        const indInfo = INDICATORS.find(i => i.value === cond.indicator);
+                        const indInfo   = INDICATORS.find(i => i.value === cond.indicator);
+                        const enabledIdx = group.conditions.filter((c,i) => c.enabled !== false && i <= ci).length; // 1-based row number among enabled
+                        const rowNum    = group.conditions.filter((c,i) => i < ci && c.enabled !== false).length + 1;
                         return (
-                          <div key={cond.id} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
+                          <div key={cond.id} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6,
+                            opacity: cond.enabled === false ? 0.45 : 1 }}>
                             <input type="checkbox" checked={cond.enabled !== false}
                               onChange={e => updateCond(group.id, cond.id, { enabled: e.target.checked })} />
-                            {/* IF label */}
-                            <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", minWidth: 14 }}>
-                              {ci === 0 ? "IF" : group.logic.toUpperCase()}
+                            {/* Row number badge */}
+                            <span style={{ fontSize: 10, fontWeight: 800, minWidth: 18, height: 18,
+                              borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center",
+                              background: cond.enabled === false ? "var(--color-background-secondary)" : "#6366f122",
+                              color: cond.enabled === false ? "var(--color-text-tertiary)" : "#6366f1",
+                              flexShrink: 0 }}>
+                              {rowNum}
                             </span>
                             {/* Indicator selector — grouped */}
                             <select value={cond.indicator}
@@ -2878,6 +3071,9 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                               </optgroup>
                               <optgroup label="ML Models">
                                 {INDICATORS.filter(i=>i.group==="ML").map(i => <option key={i.value} value={i.value}>{i.label}</option>)}
+                              </optgroup>
+                              <optgroup label="Multi-Timeframe SMA/EMA/RSI">
+                                {INDICATORS.filter(i=>i.group==="Multi-TF").map(i => <option key={i.value} value={i.value}>{i.label}</option>)}
                               </optgroup>
                               <optgroup label="Position / Exit">
                                 {INDICATORS.filter(i=>i.group==="Position").map(i => <option key={i.value} value={i.value}>{i.label}</option>)}
@@ -2908,8 +3104,60 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                           </div>
                         );
                       })}
+                      {/* Custom logic expression field */}
+                      <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ fontSize: 10, color: "var(--color-text-secondary)", fontWeight: 600, flexShrink: 0 }}>
+                            Logic:
+                          </span>
+                          <input
+                            value={group.customLogic || ""}
+                            onChange={e => updateGroup(group.id, { customLogic: e.target.value })}
+                            placeholder={`e.g. (1 AND 2) OR (3 AND 4)`}
+                            style={{ flex: 1, fontSize: 11, padding: "3px 8px", borderRadius: 5,
+                              border: `0.5px solid ${group.customLogic ? "#6366f1" : "var(--color-border-secondary)"}`,
+                              background: "var(--color-background-primary)", color: "var(--color-text-primary)",
+                              fontFamily: "monospace" }}
+                          />
+                          {group.customLogic && (
+                            <button onClick={() => updateGroup(group.id, { customLogic: "" })}
+                              title="Clear custom logic — revert to sequential AND"
+                              style={{ fontSize: 11, color: "var(--color-text-tertiary)", background: "none",
+                                border: "none", cursor: "pointer", padding: "0 4px" }}>✕</button>
+                          )}
+                        </div>
+                        {/* Hints */}
+                        <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", lineHeight: 1.6, paddingLeft: 38 }}>
+                          {group.customLogic ? (
+                            <span style={{ color: "#6366f1" }}>
+                              Custom logic active — row numbers above correspond to enabled conditions only.
+                            </span>
+                          ) : (
+                            <>
+                              Leave blank for sequential AND. Examples:
+                              <span style={{ fontFamily: "monospace", marginLeft: 4, color: "#6366f1", cursor: "pointer" }}
+                                onClick={() => updateGroup(group.id, { customLogic: "(1 AND 2) OR (3 AND 4)" })}>
+                                (1 AND 2) OR (3 AND 4)
+                              </span>
+                              {" · "}
+                              <span style={{ fontFamily: "monospace", color: "#6366f1", cursor: "pointer" }}
+                                onClick={() => updateGroup(group.id, { customLogic: "1 AND (2 OR 3)" })}>
+                                1 AND (2 OR 3)
+                              </span>
+                              {" · "}
+                              <span style={{ fontFamily: "monospace", color: "#6366f1", cursor: "pointer" }}
+                                onClick={() => updateGroup(group.id, { customLogic: "NOT 1 AND 2" })}>
+                                NOT 1 AND 2
+                              </span>
+                              <br />
+                              Supports: AND · OR · NOT · parentheses · row numbers (enabled rows only, 1-based)
+                            </>
+                          )}
+                        </div>
+                      </div>
+
                       <button onClick={() => addCond(group.id)}
-                        style={{ marginTop: 4, fontSize: 10, color: "#6366f1", background: "transparent",
+                        style={{ marginTop: 6, fontSize: 10, color: "#6366f1", background: "transparent",
                           border: "0.5px dashed #6366f166", borderRadius: 4, padding: "3px 10px", cursor: "pointer" }}>
                         + Add condition
                       </button>
@@ -2926,6 +3174,7 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                   {/* Legend */}
                   <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", lineHeight: 1.7,
                     padding: "8px 12px", borderRadius: 7, background: "var(--color-background-secondary)" }}>
+                    <strong>Multi-TF indicators</strong> (sma20_1m, sma50_5m, rsi_15m etc.) use real wall-clock time buffers — they need time to fill: 1min needs 20min for SMA20, 5min needs 100min, 1hr needs 20hrs. Values show % distance from current price (positive = price is above the SMA).{" "}
                     <strong>Entry groups</strong> (BUY/SELL/HOLD) cast weighted votes combined via the top-level AND/OR.{" "}
                     <strong>Exit groups</strong> fire immediately when their conditions pass — no voting, first match wins by weight.{" "}
                     <strong>Position indicators</strong> (unrealized %, held time, peak profit, drawdown) are only available when a position is open.{" "}
@@ -2958,11 +3207,123 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
 // Pure-JS in-browser RF — no TF.js needed, trains in < 100ms, works from tick 10
 // Predicts P(price up in next 5 ticks) from current indicator snapshot
 
-const RF_MIN_SAMPLES = 10;   // start predicting after just 10 labelled samples
-const RF_N_TREES     = 20;   // number of decision trees
-const RF_MAX_DEPTH   = 4;    // max tree depth (prevents overfitting on small datasets)
-const rfPredCache    = {};   // { BTC: { directionProbability, trainedOn } }
-const rfModels       = {};   // { BTC: forest }
+const RF_MIN_SAMPLES = 10;
+const RF_N_TREES     = 20;
+const RF_MAX_DEPTH   = 4;
+const rfPredCache    = {};
+const rfModels       = {};
+
+// ─── Reinforcement Learning (Q-Learning) ─────────────────────────────────────
+// State: discretised indicator snapshot (RSI band, MACD sign, BB zone, trend)
+// Actions: 0=HOLD, 1=BUY, 2=SELL
+// Reward: net P&L of completed trade (positive = good, negative = bad)
+// Q-table: state → [q_hold, q_buy, q_sell] — updated via Bellman equation
+const RL_ALPHA        = 0.1;   // learning rate
+const RL_GAMMA        = 0.9;   // discount factor
+const RL_EPSILON_START = 0.4;  // initial exploration rate
+const RL_EPSILON_MIN   = 0.05; // minimum exploration (always explore a little)
+const RL_EPSILON_DECAY = 0.995;// decay per episode
+const RL_MIN_EPISODES  = 20;   // minimum episodes before trusting predictions
+const RL_DIR_THRESHOLD = 0.6;  // Q-value confidence threshold for BUY/SELL
+
+const rlTables   = {};  // { BTC: { qTable: Map<state,float[]>, epsilon, episodes } }
+const rlPredCache = {}; // { BTC: { action, confidence, directionProbability, episodes } }
+
+// Discretise continuous indicators into a compact state string
+function getRLState(indicators, volumeRatio) {
+  const rsi  = indicators?.rsi ?? 50;
+  const macd = indicators?.macd ?? 0;
+  const boll = indicators?.boll
+    ? (indicators.currentPrice - indicators.boll.lower) /
+      (indicators.boll.upper - indicators.boll.lower || 1)
+    : 0.5;
+  const vol  = volumeRatio ?? 1;
+
+  // Discretise each feature into 3–4 bins
+  const rsiBand  = rsi < 35 ? 0 : rsi > 65 ? 2 : 1;          // oversold/neutral/overbought
+  const macdSign = macd < -0.0005 ? 0 : macd > 0.0005 ? 2 : 1; // bear/flat/bull
+  const bollZone = boll < 0.2 ? 0 : boll > 0.8 ? 2 : 1;        // low/mid/high
+  const volZone  = vol < 0.8 ? 0 : vol > 1.3 ? 2 : 1;          // low/normal/high
+
+  return `${rsiBand}${macdSign}${bollZone}${volZone}`; // e.g. "0212"
+}
+
+// Initialise or get Q-table entry
+function getQ(table, state) {
+  if (!table.has(state)) table.set(state, [0, 0, 0]); // [HOLD, BUY, SELL]
+  return table.get(state);
+}
+
+// Update Q-table after trade completes (Bellman equation)
+function rlUpdate(coin, prevState, action, reward, nextState) {
+  if (!rlTables[coin]) return;
+  const { qTable } = rlTables[coin];
+  const q      = getQ(qTable, prevState);
+  const qNext  = getQ(qTable, nextState);
+  const maxQ   = Math.max(...qNext);
+  const actionIdx = action === "BUY" ? 1 : action === "SELL" ? 2 : 0;
+  // Q(s,a) ← Q(s,a) + α[r + γ·maxQ(s') - Q(s,a)]
+  q[actionIdx] = q[actionIdx] + RL_ALPHA * (reward + RL_GAMMA * maxQ - q[actionIdx]);
+  rlTables[coin].episodes++;
+  // Decay exploration rate
+  rlTables[coin].epsilon = Math.max(
+    RL_EPSILON_MIN,
+    rlTables[coin].epsilon * RL_EPSILON_DECAY
+  );
+}
+
+// Get RL action for current state (epsilon-greedy)
+function rlPredict(coin, indicators, volumeRatio) {
+  if (!rlTables[coin]) {
+    rlTables[coin] = { qTable: new Map(), epsilon: RL_EPSILON_START, episodes: 0 };
+  }
+  const { qTable, epsilon, episodes } = rlTables[coin];
+  const state = getRLState(indicators, volumeRatio);
+
+  // Store current state for later update
+  rlTables[coin].lastState = state;
+
+  let actionIdx;
+  if (Math.random() < epsilon) {
+    // Explore: random action
+    actionIdx = Math.floor(Math.random() * 3);
+  } else {
+    // Exploit: best known action
+    const q = getQ(qTable, state);
+    actionIdx = q.indexOf(Math.max(...q));
+  }
+
+  const actions = ["HOLD", "BUY", "SELL"];
+  const action  = actions[actionIdx];
+  const q       = getQ(qTable, state);
+  const maxQ    = Math.max(...q);
+  const minQ    = Math.min(...q);
+  const range   = maxQ - minQ || 1;
+
+  // Normalise BUY Q-value to 0–1 as directionProbability
+  const dirProb = (q[1] - minQ) / range;
+
+  // Confidence: how much better is the best action vs average
+  const avgQ      = (q[0] + q[1] + q[2]) / 3;
+  const confidence = Math.min(99, Math.round(Math.abs(maxQ - avgQ) / (Math.abs(maxQ) + 0.001) * 100));
+
+  rlPredCache[coin] = {
+    action, confidence, directionProbability: dirProb,
+    episodes, epsilon: epsilon.toFixed(3), state,
+    qValues: q.map(v => v.toFixed(3)),
+  };
+  return rlPredCache[coin];
+}
+
+// Called after a trade closes — provide reward signal to the RL agent
+function rlReward(coin, action, netPnl, indicators, volumeRatio) {
+  if (!rlTables[coin]) return;
+  const prevState = rlTables[coin].lastState || "1111";
+  const nextState = getRLState(indicators, volumeRatio);
+  // Reward: net P&L normalised, with a small penalty for HOLD to encourage action
+  const reward = action === "HOLD" ? -0.001 : netPnl;
+  rlUpdate(coin, prevState, action, reward, nextState);
+}
 
 // Extract feature snapshot from current indicator state
 function buildRFFeatures(prices, indicators, volumeRatio) {
@@ -3358,7 +3719,8 @@ CURRENT POSITION: ${positionStr}
 RECENT TRADES: ${historyStr}
 
 TRADING RULES
-Trade size: $${settings.tradeSizeUSD}
+Starting balance: $${settings.tradeSizeUSD}
+Current trade size (compounding balance): $${settings.currentBalance || settings.tradeSizeUSD}
 Fee per side: ${settings.feePercent}%
 Round-trip fee cost: ${(parseFloat(settings.feePercent||0.1)*2).toFixed(3)}%
 Break-even move needed: ${(parseFloat(settings.feePercent||0.1)*2).toFixed(3)}% (price must move MORE than this to profit)
@@ -3590,7 +3952,8 @@ function CryptoAlgoTrader() {
   // Coinbase automation state
   const [creds, setCreds] = useState({
     provider: "coinbase",           // active exchange
-    tradeSizeUSD:  "50",
+    tradeSizeUSD:    "50",
+    balanceBuffer:   "0.50",  // deduct this from live exchange balance before trading ($)
     minConfidence: "60",
     feePercent:    "0.1",   // default 0.10% per trade (Binance.US maker/taker)
     enabledCoins:  ["BTC"],
@@ -3641,67 +4004,73 @@ function CryptoAlgoTrader() {
       groups: [
         {
           id: "g1",
+          customLogic: "",
           label: "Oversold entry",
           logic: "and",   // "and" | "or" within this group
           action: "BUY",  // what this group signals when it passes
           weight: 2,      // vote weight when group passes
           conditions: [
             { id: "c1", indicator: "rsi",    op: "<",  value: "35",  enabled: true },
-            { id: "c2", indicator: "macd",   op: ">",  value: "0",   enabled: true },
+            { id: "c2", indicator: "macd",   op: ">",  value: "0",   enabled: true, combiner: "and" },
           ],
         },
         {
           id: "g2",
+          customLogic: "",
           label: "Overbought exit signal",
           logic: "or",
           action: "SELL",
           weight: 2,
           conditions: [
-            { id: "c3", indicator: "rsi",         op: ">", value: "65",  enabled: true },
-            { id: "c4", indicator: "bollingerPct", op: ">", value: "0.9", enabled: true },
+            { id: "c3", indicator: "rsi",         op: ">", value: "65",  enabled: true, combiner: "and" },
+            { id: "c4", indicator: "bollingerPct", op: ">", value: "0.9", enabled: true, combiner: "and" },
           ],
         },
         {
           id: "g3",
+          customLogic: "",
           label: "Trailing take-profit (1% drawdown from peak)",
           logic: "and",
           action: "TRAILING_TAKE_PROFIT",
           weight: 3,
           conditions: [
-            { id: "c5", indicator: "peakProfitPct",    op: ">", value: "1.5", enabled: true },
-            { id: "c6", indicator: "drawdownFromPeak",  op: ">", value: "1.0", enabled: true },
+            { id: "c5", indicator: "peakProfitPct",    op: ">", value: "1.5", enabled: true, combiner: "and" },
+            { id: "c6", indicator: "drawdownFromPeak",  op: ">", value: "1.0", enabled: true, combiner: "and" },
           ],
         },
         {
           id: "g4",
+          customLogic: "",
           label: "Time-based exit (30 min max hold)",
           logic: "and",
           action: "TIME_EXIT",
           weight: 2,
           conditions: [
-            { id: "c7", indicator: "heldMinutes", op: ">", value: "30", enabled: false },
+            { id: "c7", indicator: "heldMinutes", op: ">", value: "30", enabled: false, combiner: "and" },
           ],
         },
         {
           id: "g5",
+          customLogic: "",
           label: "Signal reversal exit",
           logic: "and",
           action: "SIGNAL_REVERSAL",
           weight: 2,
           conditions: [
-            { id: "c8", indicator: "signalScore", op: "<", value: "-1", enabled: false },
-            { id: "c9", indicator: "unrealizedPct", op: ">", value: "0.5", enabled: false },
+            { id: "c8", indicator: "signalScore", op: "<", value: "-1", enabled: false, combiner: "and" },
+            { id: "c9", indicator: "unrealizedPct", op: ">", value: "0.5", enabled: false, combiner: "and" },
           ],
         },
         {
           id: "g6",
+          customLogic: "",
           label: "Dynamic exit when session profitable",
           logic: "and",
           action: "DYNAMIC_EXIT",
           weight: 1,
           conditions: [
-            { id: "c10", indicator: "totalPnl",       op: ">", value: "20", enabled: false },
-            { id: "c11", indicator: "unrealizedPct",  op: ">", value: "1",  enabled: false },
+            { id: "c10", indicator: "totalPnl",       op: ">", value: "20", enabled: false, combiner: "and" },
+            { id: "c11", indicator: "unrealizedPct",  op: ">", value: "1",  enabled: false, combiner: "and" },
           ],
         },
       ],
@@ -3794,7 +4163,9 @@ function CryptoAlgoTrader() {
   const [agentStatus,  setAgentStatus]  = useState("idle");
   const [agentLog,     setAgentLog]     = useState([]);
   const agentDecisionRef   = useRef(null);
-  const [txLog, setTxLog]   = useState([]);
+  const [txLog, setTxLog]       = useState([]);
+  const sessionBalanceRef         = useRef(null);  // running balance (compounds with P&L)
+  const [sessionBalance, setSessionBalance] = useState(null); // null = not started yet
   const adaptivePendingRef  = useRef({});
   const [adaptiveState, setAdaptiveState] = useState({});
   // LSTM state
@@ -3811,9 +4182,9 @@ function CryptoAlgoTrader() {
   });
 
   const stateRef = useRef({
-    BTC: { prices: [COIN_BASE.BTC], volumes: [1], history: [], pnl: 0, position: null, trades: 0 },
-    ETH: { prices: [COIN_BASE.ETH], volumes: [1], history: [], pnl: 0, position: null, trades: 0 },
-    SOL: { prices: [COIN_BASE.SOL], volumes: [1], history: [], pnl: 0, position: null, trades: 0 },
+    BTC: { prices: [COIN_BASE.BTC], volumes: [1], history: [], pnl: 0, position: null, trades: 0, mtf: initMTFBuffers() },
+    ETH: { prices: [COIN_BASE.ETH], volumes: [1], history: [], pnl: 0, position: null, trades: 0, mtf: initMTFBuffers() },
+    SOL: { prices: [COIN_BASE.SOL], volumes: [1], history: [], pnl: 0, position: null, trades: 0, mtf: initMTFBuffers() },
   });
   // Latest live prices — written by WebSocket (primary) or 5s HTTP poller (fallback)
   const livePriceRef = useRef({});
@@ -4136,6 +4507,7 @@ function CryptoAlgoTrader() {
             rfPrediction:   rfPred,
             settings: {
               tradeSizeUSD:    creds.tradeSizeUSD,
+              currentBalance:  sessionBalanceRef.current?.toFixed(2) || creds.tradeSizeUSD,
               feePercent:      creds.feePercent,
               minConfidence:   creds.minConfidence,
               indicatorConfig: creds.indicatorConfig,
@@ -4400,7 +4772,9 @@ function CryptoAlgoTrader() {
       return { success: true, sandbox: true };
     }
     try {
-      const tradeUSD = parseFloat(creds.tradeSizeUSD);
+      // Compounding balance: starts at tradeSizeUSD, grows/shrinks with realized P&L
+      // sessionBalanceRef.current is updated after each SELL
+      const tradeUSD = sessionBalanceRef.current || parseFloat(creds.tradeSizeUSD) || 50;
       const baseSize = explicitBaseSize !== null
         ? roundLotSize(explicitBaseSize, coin)  // use actual filled qty for SELL
         : tradeUSD / price;                      // estimate for BUY (exchange rounds to lot size)
@@ -4408,6 +4782,54 @@ function CryptoAlgoTrader() {
       const keys = creds.keys?.[creds.provider] || {};
 
       if (!PROXY_BASE) throw new Error("No proxy URL — set PROXY_BASE to your Cloud Run function URL");
+
+      // ── Live balance check before BUY ────────────────────────────────────────
+      // Fetch real exchange USD balance, apply buffer, cap tradeUSD to available funds
+      let safeTradeUSD = tradeUSD;
+      if (action === "BUY") {
+        try {
+          const balRes  = await fetch(`${PROXY_BASE}/balance`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ exchange: creds.provider, ...keys }),
+          });
+          const balData = await balRes.json();
+          // Exchange returns USD balance — find it (field name varies by exchange)
+          const rawUSD = balData?.USD ?? balData?.usd ?? balData?.USDT ?? balData?.usdt
+            ?? balData?.balances?.USD ?? balData?.balances?.USDT ?? null;
+
+          if (rawUSD !== null && rawUSD !== undefined) {
+            const buffer       = parseFloat(creds.balanceBuffer) || 0.50;
+            const available    = Math.max(0, parseFloat(rawUSD) - buffer);
+            const cappedTrade  = Math.min(safeTradeUSD, available);
+
+            addAutoLog(
+              `[BALANCE] Exchange USD: $${parseFloat(rawUSD).toFixed(2)} → available: $${available.toFixed(2)} (buffer: $${buffer.toFixed(2)}) → trading: $${cappedTrade.toFixed(2)}`,
+              "info"
+            );
+
+            if (available < 1) {
+              addAutoLog(`[BALANCE] Insufficient funds ($${available.toFixed(2)} after buffer) — BUY skipped`, "error");
+              return { success: false, reason: "insufficient_funds" };
+            }
+
+            safeTradeUSD = cappedTrade;
+
+            // Also sync sessionBalance to actual exchange balance if it's drifted
+            if (sessionBalanceRef.current && Math.abs(sessionBalanceRef.current - available) > 1) {
+              sessionBalanceRef.current = cappedTrade;
+              setSessionBalance(cappedTrade);
+            }
+          } else {
+            addAutoLog(`[BALANCE] Could not read USD balance from exchange response — proceeding with $${safeTradeUSD.toFixed(2)}`, "warn");
+          }
+        } catch (e) {
+          addAutoLog(`[BALANCE] Balance check failed: ${e.message} — proceeding with $${safeTradeUSD.toFixed(2)}`, "warn");
+        }
+      }
+
+      // Use safeTradeUSD (balance-checked and buffer-adjusted) for all order sizing
+      const effectiveTradeUSD = action === "BUY" ? safeTradeUSD : tradeUSD;
 
       // ── BUY: limit order support (maker trades, lower fees) ─────────────────
       const buyCfg         = creds.buyOrderConfig;
@@ -4421,7 +4843,7 @@ function CryptoAlgoTrader() {
           body: JSON.stringify({
             exchange:     creds.provider,
             coin,
-            quoteSize:    tradeUSD,
+            quoteSize:    effectiveTradeUSD,
             currentPrice: price,
             buyConfig:    buyCfg,
             ...keys,
@@ -4467,7 +4889,7 @@ function CryptoAlgoTrader() {
           res = await fetch(`${PROXY_BASE}/order`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ exchange: creds.provider, coin, side: action, quoteSize: tradeUSD, baseSize, ...keys }),
+            body: JSON.stringify({ exchange: creds.provider, coin, side: action, quoteSize: action === 'BUY' ? effectiveTradeUSD : tradeUSD, baseSize, ...keys }),
           });
         } else {
           const data = await (res.json().catch(() => advData));
@@ -4486,7 +4908,7 @@ function CryptoAlgoTrader() {
             exchange:   creds.provider,
             coin,
             side:       action,
-            quoteSize:  tradeUSD,
+            quoteSize:  action === 'BUY' ? effectiveTradeUSD : tradeUSD,
             baseSize,
             ...keys,
           }),
@@ -4625,6 +5047,9 @@ function CryptoAlgoTrader() {
       setWarmingUp(true);
 
       setAutoStatus("live");
+      const initBalLive = parseFloat(creds.tradeSizeUSD) || 50;
+      sessionBalanceRef.current = initBalLive;
+      setSessionBalance(initBalLive);
       setWsEnabled(true);
       setAutoEnabled(true);
       setRunning(true);
@@ -4655,7 +5080,8 @@ function CryptoAlgoTrader() {
     action === "BUY" ? setManualBuying(true) : setManualSelling(true);
 
     const s = stateRef.current[coin];
-    const tradeUSD = parseFloat(creds.tradeSizeUSD) || 50;
+    // Use compounding session balance for live trades too
+    const tradeUSD = sessionBalanceRef.current || parseFloat(creds.tradeSizeUSD) || 50;
     const baseSize = tradeUSD / price;
 
     // Update local position state
@@ -4794,6 +5220,8 @@ function CryptoAlgoTrader() {
     trailingHighRef.current = { BTC: null, ETH: null, SOL: null };
     trailingTpRef.current   = { BTC: null, ETH: null, SOL: null };
     agentDecisionRef.current = null;
+    sessionBalanceRef.current = null;
+    setSessionBalance(null);
     addAutoLog("Live trading stopped", "warn");
   }, [addAutoLog]);
 
@@ -4872,6 +5300,9 @@ function CryptoAlgoTrader() {
         const vol = spread > 0 ? Math.max(0.3, Math.min(3, 1 / spread)) : 1;
         cs.volumes.push(vol);
         if (cs.volumes.length > 200) cs.volumes.shift();
+        // Update multi-timeframe buffers — price sampled at fixed wall-clock intervals
+        if (!cs.mtf) cs.mtf = initMTFBuffers();
+        updateMTFBuffers(cs.mtf, live.price);
       }
       // If no live price yet — hold last known price, do not generate synthetic data
 
@@ -4881,6 +5312,8 @@ function CryptoAlgoTrader() {
 
       const ip = creds.indicatorPeriods || { smaFast:20, smaMid:50, smaSlow:99, emaFast:12, emaSlow:26, rsi:14, bollinger:20, atr:14 };
       const bollPeriod = ip.bollinger;
+      // Multi-timeframe SMA/EMA computed on time-downsampled price buffers
+      const mtfInds = cs.mtf ? calcMTFIndicators(cs.mtf) : {};
       const indicators = {
         currentPrice: newPrice,
         sma20:  calcSMA(cs.prices, ip.smaFast),
@@ -4892,12 +5325,15 @@ function CryptoAlgoTrader() {
         boll:   calcBollinger(cs.prices, bollPeriod),
         macd:   calcMACD(cs.prices),
         atr:    calcATR(cs.prices, ip.atr),
+        ...mtfInds,  // sma20_1m, sma50_1m, sma20_5m, sma50_5m, etc.
       };
 
-      // RF classifier: sync, updates rfPredCache every tick (trains after 15 samples)
+      // RF classifier: sync, updates rfPredCache every tick
       if (cs.prices.length >= RF_MIN_SAMPLES + 5) {
         try { updateRF(coin, cs.prices, indicators, volumeRatio); } catch (_) {}
       }
+      // RL agent: epsilon-greedy Q-learning, updates every tick
+      try { rlPredict(coin, indicators, volumeRatio); } catch (_) {}
 
       // ── Signal source routing ─────────────────────────────────────────────────
       const src = creds.signalSource || "rules";
@@ -4940,6 +5376,17 @@ function CryptoAlgoTrader() {
       // DeepSeek agent decision (async, may be stale)
       const agentDecision = (src === "deepseek") && agentDecisionRef.current?.[coin];
 
+      // RL signal from Q-learning agent
+      const rlCache  = rlPredCache[coin];
+      const rlProb   = rlCache?.directionProbability ?? 0.5;
+      const rlSignal = (src === "rl") && rlCache && rlCache.episodes >= RL_MIN_EPISODES ? {
+        action:         rlCache.action,
+        confidence:     String(rlCache.confidence),
+        score:          rlCache.action === "BUY" ? "2" : rlCache.action === "SELL" ? "-2" : "0",
+        reasons:        [{ label: `RL Q[H:${rlCache.qValues?.[0]} B:${rlCache.qValues?.[1]} S:${rlCache.qValues?.[2]}] ε=${rlCache.epsilon} ep=${rlCache.episodes}`, vote: rlCache.action === "BUY" ? 1 : -1 }],
+        agreeingCount:  1, totalIndicators: 1, fromRL: true,
+      } : null;
+
       // RF signal: convert directionProbability → BUY/SELL/HOLD
       const rfProb   = rfPredCache[coin]?.directionProbability ?? 0.5;
       const rfSignal = (src === "rf" || src === "rf+lstm") && rfPredCache[coin] ? {
@@ -4979,6 +5426,7 @@ function CryptoAlgoTrader() {
 
       // Final signal: pick based on signalSource
       const signal = agentDecision
+        || (src === "rl"      && rlSignal)
         || (src === "rf+lstm" && combinedSignal)
         || (src === "rf"      && rfSignal)
         || (src === "lstm"    && lstmSignal)
@@ -5205,7 +5653,7 @@ function CryptoAlgoTrader() {
       const lstmDirProb    = lstmPredCache[coin]?.directionProbability ?? 0.5;
       const rfDirProb      = rfPredCache[coin]?.directionProbability   ?? 0.5;
       // Use whichever predictor is more confident (RF warmup=10 ticks, LSTM=80 ticks)
-      const bestDirProb    = Math.max(lstmDirProb, rfDirProb);
+      const bestDirProb    = Math.max(lstmDirProb, rfDirProb, rlProb ?? 0.5);
       const atr            = calcATR(cs.prices, 14);
       const atrPct         = atr && newPrice ? (atr / newPrice * 100) : 999;
 
@@ -5320,11 +5768,13 @@ function CryptoAlgoTrader() {
               pendingRef.current[coin] = null;
             });
         } else if (!autoEnabled) {
-          // SIMULATION only
-          const simSize = parseFloat(creds.tradeSizeUSD) / newPrice;
+          // SIMULATION only — use compounding sessionBalance, not fixed tradeSizeUSD
+          const simTradeUSD = sessionBalanceRef.current || parseFloat(creds.tradeSizeUSD) || 50;
+          const simSize = simTradeUSD / newPrice;
           cs.position = { price: newPrice, size: simSize, entryTick: tickRef.current, sim: true, algoOwned: true };
           cs.trades++;
           const simFees = simSize * newPrice * (parseFloat(creds.feePercent || 0) / 100);
+          addAutoLog(`🛒 SIM BUY ${coin} — using balance $${simTradeUSD.toFixed(2)}`, "info");
           logTransaction("BUY", coin, newPrice, simSize, null, simFees, null,
             agentDecisionRef.current?.[coin]?.reasoning, lstmPredCache[coin]);
         }
@@ -5383,6 +5833,15 @@ function CryptoAlgoTrader() {
               setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
               cooldownRef.current[coin] = Date.now();
               addAutoLog(`${coin} cooling off - next BUY in ${creds.cooldownMinutes || 1} min`, "info");
+              // Reward RL agent
+              try { rlReward(coin, "SELL", profit - feeCost, indicators, volumeRatio); } catch (_) {}
+              // Update compounding session balance
+              if (sessionBalanceRef.current !== null) {
+                const newBal = Math.max(1, sessionBalanceRef.current + profit - feeCost);
+                sessionBalanceRef.current = newBal;
+                setSessionBalance(newBal);
+                addAutoLog(`💰 Balance updated: $${newBal.toFixed(2)} (${profit >= 0 ? "+" : ""}$${profit.toFixed(2)} net)`, "info");
+              }
               // Log SELL transaction
               logTransaction("SELL", coin, actualSellPrice, posAtSell.size, profit, feeCost, sellReason,
                 agentDecisionRef.current?.[coin]?.reasoning, lstmPredCache[coin]);
@@ -5402,6 +5861,14 @@ function CryptoAlgoTrader() {
           cs.position = null;
           cs.trades++;
           cooldownRef.current[coin] = Date.now();
+          // Reward RL agent with trade outcome
+          try { rlReward(coin, "SELL", profit - simFees, indicators, volumeRatio); } catch (_) {}
+          // Update compounding session balance
+          if (sessionBalanceRef.current !== null) {
+            const newBal = Math.max(1, sessionBalanceRef.current + profit);
+            sessionBalanceRef.current = newBal;
+            setSessionBalance(newBal);
+          }
           logTransaction("SELL", coin, newPrice, simPos.size, profit, simFees, sellReason,
             agentDecisionRef.current?.[coin]?.reasoning, lstmPredCache[coin]);
         }
@@ -5572,6 +6039,22 @@ function CryptoAlgoTrader() {
           </div>
 
           {cbError && <span style={{ fontSize: 11, color: "#ef4444", flex: 1 }}><i className="ti ti-alert-circle" aria-hidden="true" /> {cbError}</span>}
+        {/* Session balance display */}
+        {running && sessionBalance !== null && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
+            <span style={{ color: "var(--color-text-tertiary)" }}>Trading balance:</span>
+            <span style={{ fontWeight: 700, color: sessionBalance >= parseFloat(creds.tradeSizeUSD || 50) ? "#10b981" : "#ef4444" }}>
+              ${sessionBalance.toFixed(2)}
+            </span>
+            {sessionBalance !== parseFloat(creds.tradeSizeUSD || 50) && (
+              <span style={{ fontSize: 10, color: sessionBalance >= parseFloat(creds.tradeSizeUSD || 50) ? "#10b981" : "#ef4444" }}>
+                ({sessionBalance >= parseFloat(creds.tradeSizeUSD || 50) ? "+" : ""}
+                ${(sessionBalance - parseFloat(creds.tradeSizeUSD || 50)).toFixed(2)} from start)
+              </span>
+            )}
+          </div>
+        )}
+
         {creds.agentMode && running && (
           <span style={{ fontSize: 11, color: "#6366f1", display: "flex", alignItems: "center", gap: 5 }}>
             <i className="ti ti-robot" aria-hidden="true" />
@@ -5602,7 +6085,13 @@ function CryptoAlgoTrader() {
             {!running ? (
               <div style={{ display: "flex", gap: 6 }}>
                 {/* Simulation-only: no credentials needed */}
-                <button onClick={() => { setWsEnabled(true); setRunning(true); addAutoLog("Simulation started - WS price feed activating", "info"); }}
+                <button onClick={() => {
+                    const initBal = parseFloat(creds.tradeSizeUSD) || 50;
+                    sessionBalanceRef.current = initBal;
+                    setSessionBalance(initBal);
+                    setWsEnabled(true); setRunning(true);
+                    addAutoLog(`Simulation started — initial balance $${initBal.toFixed(2)}`, "info");
+                  }}
                   style={{ padding: "6px 14px", borderRadius: 7, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-secondary)", color: "var(--color-text-secondary)", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
                   <i className="ti ti-player-play" aria-hidden="true" /> Simulate
                 </button>
@@ -6112,9 +6601,25 @@ function CryptoAlgoTrader() {
               <span style={{ width: 7, height: 7, borderRadius: "50%", display: "inline-block",
                 background: lstmStatus === "ready" ? "#10b981" : lstmStatus === "training" ? "#f59e0b" : lstmStatus === "error" ? "#ef4444" : "#94a3b8" }} />
               <span style={{ color: "var(--color-text-secondary)" }}>
-                LSTM: {lstmStatus === "idle" ? "idle" : lstmStatus === "loading" ? "loading TF.js..." : lstmStatus === "training" ? "training..." : lstmStatus === "ready" ? "ready" : `error — check console`}
+                LSTM: {lstmStatus === "idle" ? "idle" : lstmStatus === "loading" ? "loading TF.js..." : lstmStatus === "training" ? "training..." : lstmStatus === "ready" ? "ready" : "error — check console"}
               </span>
             </span>
+            {/* RL status per coin */}
+            {creds.signalSource === "rl" && creds.enabledCoins.map(c => {
+              const rl = rlPredCache[c];
+              if (!rl) return <span key={c} style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{c}: RL warming up...</span>;
+              return (
+                <span key={c} style={{ fontSize: 10, display: "flex", gap: 5, padding: "2px 8px", borderRadius: 5,
+                  background: "var(--color-background-primary)", border: "0.5px solid #6366f144" }}>
+                  <span style={{ color: COIN_COLORS[c], fontWeight: 600 }}>{c}</span>
+                  <span style={{ color: "#6366f1" }}>🎮</span>
+                  <span style={{ color: rl.action==="BUY"?"#10b981":rl.action==="SELL"?"#ef4444":"#94a3b8", fontWeight: 700 }}>{rl.action}</span>
+                  <span style={{ color: "var(--color-text-tertiary)" }}>ep:{rl.episodes}</span>
+                  <span style={{ color: "var(--color-text-tertiary)" }}>ε:{rl.epsilon}</span>
+                  {rl.episodes < RL_MIN_EPISODES && <span style={{ color: "#f59e0b" }}>exploring</span>}
+                </span>
+              );
+            })}
             {creds.enabledCoins.map(coin => {
               const p   = lstmPred[coin];
               const rf  = rfPredCache[coin];
