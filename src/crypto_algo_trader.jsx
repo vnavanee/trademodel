@@ -1,7 +1,10 @@
 import { useState, useEffect, useRef, useCallback, Component } from "react";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
 // Clerk auth — requires: npm install @clerk/clerk-react
 // If not using auth, these are unused but don't break anything
-import { useClerk, useUser } from "@clerk/clerk-react";
+import { useClerk, useUser, useSession } from "@clerk/clerk-react";
+import OnboardingTour, { TOUR_STEPS } from "./OnboardingTour";
+import MarketplacePanel from "./MarketplacePanel";
 
 // ─── Error Boundary — shows readable crash message instead of blank screen ────
 class ErrorBoundary extends Component {
@@ -28,20 +31,241 @@ class ErrorBoundary extends Component {
     return this.props.children;
   }
 }
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const COINS = ["BTC", "ETH", "SOL"];
 const COIN_COLORS = { BTC: "#f59e0b", ETH: "#6366f1", SOL: "#10b981" };
 // Fallback baselines — used only if proxy is unreachable
 const COIN_BASE = { BTC: 63000, ETH: 3000, SOL: 145 };
+
+// Default settings — defined at module level so the useState initialiser
+// (which runs synchronously) can reference it without TDZ issues.
+// API keys intentionally blank — set via Settings or Cloud Run env vars.
+const CREDS_DEFAULTS = {
+  provider: "coinbase",           // active exchange
+  tradeSizeUSD:    "50",
+  balanceBuffer:   "0.50",  // deduct this from live exchange balance before trading ($)
+  minConfidence: "60",
+  feePercent:    "0.1",   // default 0.10% per trade (Binance.US maker/taker)
+  enabledCoins:  ["BTC"],
+  sandbox: false,
+  keys: {                         // per-provider API credentials
+    coinbase: { apiKeyName: "", privateKey: "" },
+    binance:  { apiKey: "", secretKey: "" },
+    kraken:   { apiKey: "", privateKey: "" },
+    gemini:   { apiKey: "", secretKey: "" },
+    alpaca:   { apiKey: "", secretKey: "" },
+    public:   { apiKey: "", secretKey: "" },
+  },
+  exitRules: {
+    BTC: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
+    ETH: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
+    SOL: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
+  },
+  exitStrategies: {
+    trailingTakeProfit: { enabled: false, trailPercent: "1.0" },
+    timeExit:        { enabled: true,  maxHoldMinutes: "30"  },
+    trailingStop:    { enabled: true,  trailPercent:   "1.5", trailDelta: "absolute" }, // "absolute"=$, "percent"=%
+    atrExit:         { enabled: false, atrMultiplier:  "1.5" },
+    atrTpSl: {
+      enabled:     false,  // use ATR × multiplier instead of fixed % for TP/SL
+      tpMultiplier: "1.5", // TP = entry + atr × this
+      slMultiplier: "0.75",// SL = entry - atr × this  (keeps 2:1 ratio)
+      partialExit: false,  // exit 50% at 1×ATR, let rest run to full TP
+    },
+    trendAlignment: {
+      enabled:      false, // require MTF trend confluence before BUY
+      requireBullish1h: true,  // price must be above SMA50 on 1h
+      requireBullish15m: true, // EMA12 > EMA26 on 15m
+      requireRsiAbove:  "45",  // 1h RSI must be above this (not in downtrend)
+      strictMode:   false, // all filters must pass (vs any 2 of 3)
+    },
+    volumeGate:      { enabled: true,  minVolumeRatio: "1.2" },
+    signalReversal:  { enabled: true,  reversalScore:  "-2"  },
+  },
+  cooldownMinutes: "1",
+  dynamicExits: {
+    enabled:         false,  // scale TP/SL based on cumulative P&L
+    mode:            "aggressive_when_winning", // "aggressive_when_winning" | "defensive_when_losing" | "both"
+    profitThreshold: "20",   // $ — above this cumulative profit, widen TP
+    lossThreshold:   "-20",  // $ — below this cumulative loss, tighten TP / SL
+    maxTpBoost:      "50",   // % — max increase to TP when winning (e.g. +50% wider)
+    maxTpCut:        "50",   // % — max decrease to TP when losing (e.g. -50% tighter, faster exits)
+    maxSlTighten:    "30",   // % — max decrease to SL when losing (protect capital)
+    scaleBy:         "total", // "total" (all coins) | "per_coin" (this coin's P&L only)
+  },
+  llmProvider: "deepseek",   // "deepseek" | "claude" | "gpt" | "gemini" | "llama"
+  llmKeys: {
+    deepseek: "", claude: "", gpt: "", gemini: "", llama: "",
+  },
+  agentMode: false,
+  agentIntervalSec: "15",
+  rlParams: {
+    alpha: "0.1", gamma: "0.9", epsilonStart: "0.4", epsilonMin: "0.05",
+    epsilonDecay: "0.995", minEpisodes: "20", rewardScale: "100", resetOnStop: true,
+  },
+  signalSource: "rules",
+  customRules: {
+    enabled: false,
+    // Each group is evaluated independently then combined with groupLogic
+    groupLogic: "and",   // "and" | "or" — how groups combine
+    groups: [
+      {
+        id: "g1",
+        customLogic: "",
+        label: "Oversold entry",
+        logic: "and",   // "and" | "or" within this group
+        action: "BUY",  // what this group signals when it passes
+        weight: 2,      // vote weight when group passes
+        conditions: [
+          { id: "c1", indicator: "rsi",    op: "<",  value: "35",  enabled: true },
+          { id: "c2", indicator: "macd",   op: ">",  value: "0",   enabled: true, combiner: "and" },
+        ],
+      },
+      {
+        id: "g2",
+        customLogic: "",
+        label: "Overbought exit signal",
+        logic: "or",
+        action: "SELL",
+        weight: 2,
+        conditions: [
+          { id: "c3", indicator: "rsi",         op: ">", value: "65",  enabled: true, combiner: "and" },
+          { id: "c4", indicator: "bollingerPct", op: ">", value: "0.9", enabled: true, combiner: "and" },
+        ],
+      },
+      {
+        id: "g3",
+        customLogic: "",
+        label: "Trailing take-profit (1% drawdown from peak)",
+        logic: "and",
+        action: "TRAILING_TAKE_PROFIT",
+        weight: 3,
+        conditions: [
+          { id: "c5", indicator: "peakProfitPct",    op: ">", value: "1.5", enabled: true, combiner: "and" },
+          { id: "c6", indicator: "drawdownFromPeak",  op: ">", value: "1.0", enabled: true, combiner: "and" },
+        ],
+      },
+      {
+        id: "g4",
+        customLogic: "",
+        label: "Time-based exit (30 min max hold)",
+        logic: "and",
+        action: "TIME_EXIT",
+        weight: 2,
+        conditions: [
+          { id: "c7", indicator: "heldMinutes", op: ">", value: "30", enabled: false, combiner: "and" },
+        ],
+      },
+      {
+        id: "g5",
+        customLogic: "",
+        label: "Signal reversal exit",
+        logic: "and",
+        action: "SIGNAL_REVERSAL",
+        weight: 2,
+        conditions: [
+          { id: "c8", indicator: "signalScore", op: "<", value: "-1", enabled: false, combiner: "and" },
+          { id: "c9", indicator: "unrealizedPct", op: ">", value: "0.5", enabled: false, combiner: "and" },
+        ],
+      },
+      {
+        id: "g6",
+        customLogic: "",
+        label: "Dynamic exit when session profitable",
+        logic: "and",
+        action: "DYNAMIC_EXIT",
+        weight: 1,
+        conditions: [
+          { id: "c10", indicator: "totalPnl",       op: ">", value: "20", enabled: false, combiner: "and" },
+          { id: "c11", indicator: "unrealizedPct",  op: ">", value: "1",  enabled: false, combiner: "and" },
+        ],
+      },
+    ],
+  },
+  ruleCombiner: {
+    logic: "and",    // "and" | "or" | "custom"
+    // custom: define per-indicator vote threshold (0.0–1.0 fraction of weighted score)
+    customThreshold: "0.3",
+    // minimum number of indicators that must agree when logic = "and"
+    minAgree: "3",
+  },
+  tradingMode: "momentum",   // "momentum" | "mean_reversion"
+  volatilityGate: {
+    enabled:       true,
+    minVolatility: "0.3",   // LSTM volatility score must exceed this
+    minAtrPct:     "0.3",   // ATR must be >= X% of price
+    minDirProb:    "0.65",  // LSTM direction probability (0.5=coin flip, 0.65=confident bull)
+  },
+  minRrRatio:    "3",        // minimum reward:risk ratio — TP must be >= N × SL
+  adaptiveSettings: {
+    enabled:       false,   // let agent auto-adjust TP/SL based on regime
+    maxTpDelta:    "2",     // max TP adjustment per session in %
+    maxSlDelta:    "1",     // max SL adjustment per session in %
+    requireHigh:   "70",   // min agent confidence to apply adjustment
+    applyAfter:    "3",    // apply only after N consistent suggestions
+  },
+  postBuyLimitSell: {
+    enabled:          false,     // place a limit sell immediately after BUY fills
+    offsetType:       "percent", // "percent" | "absolute"
+    offsetValue:      "1.5",     // place limit sell X% or $X above fill price
+    // e.g. buy fills at $65,000 → limit sell at $65,975 (1.5% above)
+    // This is a maker sell order — 0% fee on Binance.US
+  },
+  buyOrderConfig: {
+    type:             "market",   // "market" | "limit"
+    limitOffsetType:  "percent",  // "percent" | "absolute"
+    limitOffsetValue: "0.05",     // place limit X% or $X ABOVE current price (maker)
+    // 0.05% above = fills quickly, qualifies as maker on most exchanges
+    // Higher = safer maker but slower fill
+  },
+  sellOrderConfig: {
+    type:               "market",   // market | limit | stop_limit | oco | trailing_stop
+    limitOffsetType:    "percent",  // percent | absolute
+    limitOffsetValue:   "0.1",      // % or $ below signal price for limit
+    stopPricePct:       "0.5",      // % below entry for stop-limit stop trigger
+    limitPricePct:      "0.6",      // % below entry for stop-limit limit price
+    ocoTpPct:           "2",        // OCO take-profit % above entry
+    ocoSlPct:           "1",        // OCO stop-loss % below entry
+    trailStopDelta:     "1.5",      // trailing stop % delta (exchange-native)
+    trailDeltaType:     "percent",  // percent | absolute
+  },
+  tickIntervalMs: 1500,  // how often runTick fires — controls real-time span of indicator periods
+  indicatorPeriods: {
+    smaFast:   20,   // ticks
+    smaMid:    50,
+    smaSlow:   99,
+    emaFast:   12,
+    emaSlow:   26,
+    rsi:       14,
+    bollinger: 20,
+    atr:       14,
+  },
+  indicatorConfig: {
+    rsi:            { enabled: true,  weight: "2",   oversold: "35",  overbought: "65" },
+    sma_20_50:      { enabled: true,  weight: "1.5", fast: "20",     slow: "50"  },
+    sma_20_99:      { enabled: false, weight: "2",   fast: "20",     slow: "99"  },
+    sma_50_99:      { enabled: false, weight: "1.5", fast: "50",     slow: "99"  },
+    ema_12_26:      { enabled: false, weight: "1.5", fast: "12",     slow: "26"  },
+    macd:           { enabled: true,  weight: "1"   },
+    bollinger:      { enabled: true,  weight: "2",   period: "20"  },
+    news:           { enabled: true,  weight: "1.5" },
+  },
+};
 const PRODUCT_IDS = { BTC: "BTC-USD", ETH: "ETH-USD", SOL: "SOL-USD" };
 
 // ─── Proxy config ─────────────────────────────────────────────────────────────
 // After deploying coinbase-cors-proxy to Vercel, paste your deployment URL here.
 // e.g. "https://coinbase-cors-proxy.vercel.app"
 // Leave as empty string to stay in simulation-only mode.
-const PROXY_BASE = "https://coinbaseticker-283150216453.europe-west1.run.app";
+const PROXY_BASE      = "https://coinbaseticker-283150216453.europe-west1.run.app";
+// Trading server (VPS) — set VITE_TRADING_SERVER in .env.local before npm run build
+// Trading server URL — set VITE_TRADING_SERVER in .env.local before npm run build
+// Can also be overridden at runtime via window.__TRADING_SERVER__ in browser console
+const TRADING_SERVER  = window.__TRADING_SERVER__
+  || (typeof import.meta !== "undefined" && import.meta.env?.VITE_TRADING_SERVER)
+  || window.__ENV__?.VITE_TRADING_SERVER
+  || "";
 
 // ─── Public price fetch via proxy, with full diagnostics ──────────────────────
 // Returns { price, ok, httpStatus, errorType, errorMsg, raw }
@@ -1266,6 +1490,27 @@ function roundLotSize(qty, coin) {
 }
 
 const fmt = (n, d = 2) => n?.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }) ?? "—";
+
+// Formats a Date (or timestamp) as "9 Sep 2026, 14:32" — always includes date so entries
+// from previous days are unambiguous. Used wherever timestamps are shown in the UI.
+const fmtDateTime = (d) => {
+  const dt = d instanceof Date ? d : new Date(d);
+  if (isNaN(dt)) return "—";
+  return dt.toLocaleString(undefined, {
+    day: "numeric", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+};
+
+// Time only (for dense log entries within the same UI where the date is already shown).
+const fmtTime = (d) => {
+  const dt = d instanceof Date ? d : new Date(d);
+  if (isNaN(dt)) return "—";
+  return dt.toLocaleString(undefined, {
+    day: "numeric", month: "short",
+    hour: "2-digit", minute: "2-digit",
+  });
+};
 const fmtPct = (n) => (n >= 0 ? "+" : "") + n?.toFixed(2) + "%";
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -1525,7 +1770,7 @@ function ExitRuleRow({ coin, rule, onChange, color }) {
   );
 }
 
-function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
+function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionContext = null, forcedTab = null }) {
   // Plan limits with safe defaults (all features on if no Clerk)
   const planLimits = limits || { maxCoins: 50, canLive: true, canAI: true };
   const defaultExitRules = {
@@ -1556,6 +1801,13 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
       timeExit:       { enabled: true,  maxHoldMinutes: "30"  },
       trailingStop:   { enabled: true,  trailPercent:   "1.5", trailDelta: "absolute" },
       atrExit:        { enabled: false, atrMultiplier:  "1.5" },
+      atrTpSl: creds.exitStrategies?.atrTpSl || {
+        enabled: false, tpMultiplier: "1.5", slMultiplier: "0.75", partialExit: false,
+      },
+      trendAlignment: creds.exitStrategies?.trendAlignment || {
+        enabled: false, requireBullish1h: true, requireBullish15m: true,
+        requireRsiAbove: "45", strictMode: false,
+      },
       volumeGate:     { enabled: true,  minVolumeRatio: "1.2" },
       signalReversal: { enabled: true,  reversalScore:  "-2"  },
     },
@@ -1567,6 +1819,16 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
     customRules:        creds.customRules         || { enabled:false, groupLogic:"and", groups:[] },
     ruleCombiner:       creds.ruleCombiner        || { logic:"and", customThreshold:"0.3", minAgree:"3" },
     agentIntervalSec:   creds.agentIntervalSec   || "15",
+    rlParams: creds.rlParams || {
+      alpha:        "0.1",   // learning rate
+      gamma:        "0.9",   // discount factor
+      epsilonStart: "0.4",   // initial exploration rate
+      epsilonMin:   "0.05",  // minimum exploration
+      epsilonDecay: "0.995", // decay per episode
+      minEpisodes:  "20",    // warmup threshold
+      rewardScale:  "100",   // multiply netPnl by this for reward signal
+      resetOnStop:  true,    // reset Q-table when simulation stops
+    },
     adaptiveSettings:   creds.adaptiveSettings   || { enabled: false, maxTpDelta: "2", maxSlDelta: "1", requireHigh: "70", applyAfter: "3" },
     tradingMode:        creds.tradingMode        || "momentum",
     volatilityGate:     creds.volatilityGate     || { enabled: true, minVolatility: "0.3", minAtrPct: "0.3", minDirProb: "0.65" },
@@ -1605,6 +1867,10 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
     },
   });
   const [activeTab, setActiveTab] = useState("provider");
+  // Allow the onboarding tour to force-switch tabs so its target elements exist
+  useEffect(() => {
+    if (forcedTab) setActiveTab(forcedTab);
+  }, [forcedTab]);
   const [showSecrets, setShowSecrets] = useState({});
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
@@ -1640,11 +1906,47 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center" }}>
       <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, padding: "24px 28px", width: 560, maxWidth: "96vw", maxHeight: "92vh", overflowY: "auto" }}>
         
+        {/* Session context banner */}
+        {sessionContext && (
+          <div style={{
+            margin: "-24px -28px 16px",
+            padding: "10px 20px",
+            background: sessionContext.isRunning ? "#065f46" : "#1e1b4b",
+            borderRadius: "14px 14px 0 0",
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {sessionContext.isRunning && (
+                <span style={{ width: 7, height: 7, borderRadius: "50%",
+                  background: "#10b981", boxShadow: "0 0 0 3px #10b98133",
+                  display: "inline-block", flexShrink: 0 }} />
+              )}
+              <span style={{ fontSize: 12, color: "rgba(255,255,255,0.7)", fontWeight: 600 }}>
+                {sessionContext.isRunning ? "🟢 Running session" : "Session settings"}
+              </span>
+              <span style={{ fontSize: 13, fontWeight: 700, color: "#fff" }}>
+                "{sessionContext.name}"
+              </span>
+            </div>
+            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.45)", textAlign: "right" }}>
+              {sessionContext.isRunning
+                ? "Changes push to the live session immediately"
+                : "Save and resume to apply changes"}
+            </span>
+          </div>
+        )}
+
         {/* Header */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
           <div>
-            <div style={{ fontWeight: 700, fontSize: 15 }}>Settings</div>
-            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>{"Exchange, credentials & trading rules"}</div>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>
+              {sessionContext ? "Session settings" : "Settings"}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>
+              {sessionContext
+                ? `Viewing settings for "${sessionContext.name}"`
+                : "Exchange, credentials & trading rules"}
+            </div>
           </div>
           <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: "var(--color-text-secondary)" }}>
             <i className="ti ti-x" aria-hidden="true" />
@@ -1653,12 +1955,12 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 5, marginBottom: 20, flexWrap: "wrap" }}>
-          <button style={tabStyle("provider")}     onClick={() => setActiveTab("provider")}>🏦 Exchange</button>
+          <button data-tour="tab-provider" style={tabStyle("provider")}     onClick={() => setActiveTab("provider")}>🏦 Exchange</button>
           <button style={tabStyle("credentials")}  onClick={() => setActiveTab("credentials")}>🔑 Keys</button>
           <button style={tabStyle("llm")}          onClick={() => setActiveTab("llm")}>🤖 AI / LLM</button>
-          <button style={tabStyle("signals")}      onClick={() => setActiveTab("signals")}>📡 Signals</button>
+          <button data-tour="tab-signals" style={tabStyle("signals")}      onClick={() => setActiveTab("signals")}>📡 Signals</button>
           <button style={tabStyle("execution")}    onClick={() => setActiveTab("execution")}>⚡ Execution</button>
-          <button style={tabStyle("exits")}        onClick={() => setActiveTab("exits")}>🎯 Exits</button>
+          <button data-tour="tab-exits" style={tabStyle("exits")}        onClick={() => setActiveTab("exits")}>🎯 Exits</button>
           <button style={tabStyle("indicators")}   onClick={() => setActiveTab("indicators")}>📊 Indicators</button>
           <button style={tabStyle("rules")}         onClick={() => setActiveTab("rules")}>⚙️ Rules</button>
         </div>
@@ -1906,7 +2208,7 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                     Initial amount — compounds with P&L during session
                   </span>
                 </div>
-                <input type="number" value={form.tradeSizeUSD} onChange={e => set("tradeSizeUSD", e.target.value)}
+                <input data-tour="trade-size-input" type="number" value={form.tradeSizeUSD} onChange={e => set("tradeSizeUSD", e.target.value)}
                   min="1" max="100000" style={{ width: "100%", boxSizing: "border-box" }} />
               </label>
               <label style={{ fontSize: 12 }}>
@@ -1966,7 +2268,7 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
               </div>
             </div>
 
-            <div>
+            <div data-tour="coins-select">
               <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8, fontWeight: 600 }}>Active trading pairs</div>
               <div style={{ display: "flex", gap: 8 }}>
                 {COINS.map(c => (
@@ -2038,6 +2340,29 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                     fields: [{ k: "atrMultiplier", label: "ATR multiplier", min: 0.5, max: 5, step: 0.1, hint: "e.g. 1.5× ATR" }],
                   },
                   {
+                    key: "atrTpSl",
+                    label: "🎯 ATR-based TP/SL (recommended)",
+                    desc: "Sets TP and SL as ATR multiples — scales with actual volatility instead of a fixed %. Partial exit closes 50% at 1×ATR then moves SL to breakeven.",
+                    fields: [
+                      { k: "tpMultiplier", label: "TP multiplier (ATR×)", min: 0.5, max: 5, step: 0.25, hint: "e.g. 1.5 = TP at entry + 1.5×ATR" },
+                      { k: "slMultiplier", label: "SL multiplier (ATR×)", min: 0.1, max: 3, step: 0.25, hint: "e.g. 0.75 = SL at entry - 0.75×ATR (2:1 R:R)" },
+                    ],
+                    extraCheckbox: { k: "partialExit", label: "Partial exit at 1×ATR (50% off, move SL to breakeven)" },
+                  },
+                  {
+                    key: "trendAlignment",
+                    label: "📈 Trend alignment gate (recommended)",
+                    desc: "Only allow BUY when higher timeframes confirm the trend direction. Prevents counter-trend entries that stall before reaching TP.",
+                    fields: [
+                      { k: "requireRsiAbove", label: "1h RSI floor", min: 30, max: 60, step: 1, hint: "Block BUY if 1h RSI below this (e.g. 45)" },
+                    ],
+                    extraCheckboxes: [
+                      { k: "requireBullish1h",  label: "Require price above 1h SMA50 (long-term uptrend)" },
+                      { k: "requireBullish15m", label: "Require 15m EMA12 > EMA26 (momentum confirming)" },
+                      { k: "strictMode",        label: "Strict: all filters must pass (default: 2 of 3)" },
+                    ],
+                  },
+                  {
                     key: "volumeGate",
                     label: "📦 Volume gate on BUY",
                     desc: "Only buy when volume ratio is above threshold",
@@ -2049,7 +2374,7 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                     desc: "Sell if signal score drops below threshold while holding",
                     fields: [{ k: "reversalScore", label: "Reversal score", min: -8, max: 0, step: 0.5, hint: "e.g. -2 triggers sell" }],
                   },
-                ].map(({ key, label, desc, fields, extra }) => {
+                ].map(({ key, label, desc, fields, extra, extraCheckbox, extraCheckboxes }) => {
                   const s = form.exitStrategies[key] || {};
                   const on = s.enabled;
                   return (
@@ -2069,37 +2394,61 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                         </span>
                       </div>
                       {on && (
-                        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                          {/* Delta type selector for trailing stop */}
-                          {extra === "trailDelta" && (
-                            <label style={{ fontSize: 11 }}>
-                              <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>Delta type</div>
-                              <select value={s.trailDelta || "percent"}
-                                onChange={e => setExitStrategy(key, { trailDelta: e.target.value })}
-                                style={{ fontSize: 11, padding: "3px 6px", borderRadius: 4, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
-                                <option value="percent">% (relative)</option>
-                                <option value="absolute">$ (absolute)</option>
-                              </select>
-                              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
-                                {s.trailDelta === "absolute" ? "$ below peak price" : "% below peak price"}
-                              </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                            {/* Delta type selector for trailing stop */}
+                            {extra === "trailDelta" && (
+                              <label style={{ fontSize: 11 }}>
+                                <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>Delta type</div>
+                                <select value={s.trailDelta || "percent"}
+                                  onChange={e => setExitStrategy(key, { trailDelta: e.target.value })}
+                                  style={{ fontSize: 11, padding: "3px 6px", borderRadius: 4, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+                                  <option value="percent">% (relative)</option>
+                                  <option value="absolute">$ (absolute)</option>
+                                </select>
+                                <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                                  {s.trailDelta === "absolute" ? "$ below peak price" : "% below peak price"}
+                                </div>
+                              </label>
+                            )}
+                            {(fields || []).map(f => (
+                              <label key={f.k} style={{ fontSize: 11, flex: 1, minWidth: 100 }}>
+                                <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>
+                                  {f.label}{extra === "trailDelta" ? (s.trailDelta === "absolute" ? " ($)" : " (%)") : ""}
+                                </div>
+                                <input type="number" value={s[f.k] ?? f.default ?? ""} min={f.min} max={f.max} step={f.step}
+                                  onChange={e => setExitStrategy(key, { [f.k]: e.target.value })}
+                                  style={{ width: "100%", boxSizing: "border-box" }} />
+                                <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                                  {extra === "trailDelta" && s.trailDelta === "absolute"
+                                    ? `Sell when price drops $${s[f.k] || "0"} below peak`
+                                    : f.hint}
+                                </div>
+                              </label>
+                            ))}
+                          </div>
+                          {/* Single extra checkbox (e.g. partial exit) */}
+                          {extraCheckbox && (
+                            <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11, cursor: "pointer" }}>
+                              <input type="checkbox" checked={!!s[extraCheckbox.k]}
+                                onChange={e => setExitStrategy(key, { [extraCheckbox.k]: e.target.checked })} />
+                              <span style={{ color: "var(--color-text-secondary)" }}>{extraCheckbox.label}</span>
                             </label>
                           )}
-                          {fields.map(f => (
-                            <label key={f.k} style={{ fontSize: 11, flex: 1, minWidth: 100 }}>
-                              <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>
-                                {f.label}{extra === "trailDelta" ? (s.trailDelta === "absolute" ? " ($)" : " (%)") : ""}
-                              </div>
-                              <input type="number" value={s[f.k] || ""} min={f.min} max={f.max} step={f.step}
-                                onChange={e => setExitStrategy(key, { [f.k]: e.target.value })}
-                                style={{ width: "100%", boxSizing: "border-box" }} />
-                              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
-                                {extra === "trailDelta" && s.trailDelta === "absolute"
-                                  ? `Sell when price drops $${s[f.k] || "0"} below peak`
-                                  : f.hint}
-                              </div>
-                            </label>
-                          ))}
+                          {/* Multiple extra checkboxes (e.g. trend alignment filters) */}
+                          {extraCheckboxes && (
+                            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                              {extraCheckboxes.map(cb => (
+                                <label key={cb.k} style={{ display: "flex", alignItems: "center", gap: 7,
+                                  fontSize: 11, cursor: "pointer" }}>
+                                  <input type="checkbox"
+                                    checked={s[cb.k] !== false}
+                                    onChange={e => setExitStrategy(key, { [cb.k]: e.target.checked })} />
+                                  <span style={{ color: "var(--color-text-secondary)" }}>{cb.label}</span>
+                                </label>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -2109,7 +2458,7 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
             </div>
 
             {/* ── Signal source ──────────────────────────────────────────────── */}
-            <div>
+            <div data-tour="signal-source-select">
               <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: "var(--color-text-secondary)" }}>
                 Signal source
                 <span style={{ fontSize: 10, fontWeight: 400, color: "var(--color-text-tertiary)", marginLeft: 8 }}>
@@ -2143,9 +2492,88 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
                 </div>
               )}
               {form.signalSource === "rl" && (
-                <div style={{ marginTop: 8, fontSize: 10, padding: "6px 10px", borderRadius: 6, background: "#6366f111", border: "0.5px solid #6366f1", color: "#4338ca" }}>
-                  RL starts with random exploration (ε=0.4) and learns from trade rewards. Needs {RL_MIN_EPISODES}+ completed trades before predictions are reliable.
-                  The longer you run, the smarter it gets. Q-values for each state are shown in the signal log.
+                <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 12 }}>
+                  <div style={{ fontSize: 10, padding: "8px 12px", borderRadius: 6,
+                    background: "#6366f111", border: "0.5px solid #6366f144", color: "#4338ca" }}>
+                    Q-learning agent — learns from actual trade outcomes. Needs{" "}
+                    <strong>{form.rlParams?.minEpisodes || 20}</strong> completed trades before signals are trusted.
+                    The longer it runs, the smarter it gets. Reset Q-table when stopping if you want a fresh start.
+                  </div>
+
+                  {/* RL parameter grid */}
+                  <div style={{ borderRadius: 9, border: "0.5px solid #6366f133",
+                    padding: "14px 16px", background: "#6366f108" }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: "#6366f1", marginBottom: 12 }}>
+                      🎮 Q-Learning parameters
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
+                      {[
+                        { key: "alpha",        label: "Learning rate (α)", min: "0.001", max: "1",    step: "0.01",  hint: "How fast Q-values update. 0.1 = slow stable, 0.5 = fast aggressive" },
+                        { key: "gamma",        label: "Discount (γ)",      min: "0",     max: "0.999", step: "0.01",  hint: "Value of future rewards. 0.9 = cares about long-term P&L" },
+                        { key: "epsilonStart", label: "Exploration start (ε)", min: "0", max: "1",    step: "0.05",  hint: "Starting random action rate. 0.4 = 40% random at first" },
+                        { key: "epsilonMin",   label: "Exploration min",   min: "0",     max: "0.5",  step: "0.01",  hint: "Always keeps this much randomness. 0.05 = 5% forever" },
+                        { key: "epsilonDecay", label: "Decay per trade",   min: "0.9",   max: "0.999",step: "0.001", hint: "Multiplied by ε after each trade. 0.995 = slow decay" },
+                        { key: "rewardScale",  label: "Reward scale",      min: "1",     max: "10000",step: "10",    hint: "Multiply P&L for reward signal. 100 = $0.50 profit → reward 50" },
+                      ].map(({ key, label, min, max, step, hint }) => (
+                        <label key={key} style={{ fontSize: 11 }}>
+                          <div style={{ color: "var(--color-text-secondary)", marginBottom: 4, fontWeight: 600 }}>{label}</div>
+                          <input type="number"
+                            value={form.rlParams?.[key] || ""}
+                            min={min} max={max} step={step}
+                            onChange={e => set("rlParams", { ...form.rlParams, [key]: e.target.value })}
+                            style={{ width: "100%", boxSizing: "border-box" }} />
+                          <div style={{ fontSize: 9, color: "var(--color-text-tertiary)", marginTop: 2, lineHeight: 1.4 }}>{hint}</div>
+                        </label>
+                      ))}
+                    </div>
+
+                    {/* minEpisodes + resetOnStop */}
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                      <label style={{ fontSize: 11 }}>
+                        <div style={{ color: "var(--color-text-secondary)", marginBottom: 4, fontWeight: 600 }}>Min episodes before trusting</div>
+                        <input type="number"
+                          value={form.rlParams?.minEpisodes || "20"} min="1" max="1000"
+                          onChange={e => set("rlParams", { ...form.rlParams, minEpisodes: e.target.value })}
+                          style={{ width: "100%", boxSizing: "border-box" }} />
+                        <div style={{ fontSize: 9, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                          Signals show as "exploring" until this many trades complete
+                        </div>
+                      </label>
+                      <label style={{ fontSize: 11, display: "flex", flexDirection: "column", justifyContent: "flex-start", gap: 6 }}>
+                        <div style={{ color: "var(--color-text-secondary)", fontWeight: 600 }}>Reset Q-table on stop</div>
+                        <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                          <input type="checkbox"
+                            checked={form.rlParams?.resetOnStop !== false}
+                            onChange={e => set("rlParams", { ...form.rlParams, resetOnStop: e.target.checked })} />
+                          <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
+                            {form.rlParams?.resetOnStop !== false ? "Q-table resets each session" : "Q-table persists across sessions"}
+                          </span>
+                        </label>
+                        <div style={{ fontSize: 9, color: "var(--color-text-tertiary)" }}>
+                          Uncheck to carry learned Q-values into the next simulation
+                        </div>
+                      </label>
+                    </div>
+
+                    {/* Live preview of decay curve */}
+                    <div style={{ marginTop: 10, fontSize: 10, padding: "8px 10px", borderRadius: 6,
+                      background: "var(--color-background-primary)", color: "var(--color-text-secondary)", lineHeight: 1.8 }}>
+                      {(() => {
+                        const eps   = parseFloat(form.rlParams?.epsilonStart || 0.4);
+                        const decay = parseFloat(form.rlParams?.epsilonDecay || 0.995);
+                        const emin  = parseFloat(form.rlParams?.epsilonMin   || 0.05);
+                        const after = (n) => Math.max(emin, eps * Math.pow(decay, n)).toFixed(3);
+                        return <>
+                          <strong>ε decay preview:</strong>{" "}
+                          start {eps.toFixed(3)} →
+                          10 trades {after(10)} →
+                          50 trades {after(50)} →
+                          100 trades {after(100)} →
+                          min {emin.toFixed(3)}
+                        </>;
+                      })()}
+                    </div>
+                  </div>
                 </div>
               )}
               {(form.signalSource === "lstm" || form.signalSource === "rf+lstm") && (
@@ -2727,6 +3155,96 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan }) {
               })()}
             </div>
 
+            {/* ── ATR-based TP/SL ─────────────────────────────────────────────── */}
+            {[
+              {
+                key: "atrTpSl",
+                label: "🎯 ATR-based TP/SL (recommended)",
+                desc: "Sets TP and SL as multiples of ATR(14) — adapts to actual market volatility instead of a fixed %. Prevents overshoot: if ATR is $800, TP is $1,200 above entry (1.5×), not a fixed 2% that may never be reached.",
+                fields: [
+                  { k: "tpMultiplier", label: "TP (ATR ×)", min: 0.5, max: 5,   step: 0.25, hint: "1.5 = TP at entry + 1.5×ATR. Keep 2:1 ratio with SL." },
+                  { k: "slMultiplier", label: "SL (ATR ×)", min: 0.1, max: 3,   step: 0.25, hint: "0.75 = SL at entry − 0.75×ATR. Maintains 2:1 R:R." },
+                ],
+                extraCheckbox: { k: "partialExit", label: "Partial exit: sell 50% at 1×ATR, move SL to breakeven on remainder" },
+              },
+              {
+                key: "trendAlignment",
+                label: "📈 Trend alignment gate (recommended)",
+                desc: "Only allow BUY when higher timeframes confirm the direction. Blocks entries when the 1h trend is bearish — the most common cause of TP targets never being reached.",
+                fields: [
+                  { k: "requireRsiAbove", label: "1h RSI floor", min: 30, max: 60, step: 1, hint: "Block BUY if 1h RSI is below this (45 = not in downtrend)" },
+                ],
+                extraCheckboxes: [
+                  { k: "requireBullish1h",  label: "1h SMA50: price must be above the 1-hour 50-period moving average (long-term uptrend)" },
+                  { k: "requireBullish15m", label: "15m EMA cross: EMA12 must be above EMA26 on 15-minute chart (momentum confirming)" },
+                  { k: "strictMode",        label: "Strict mode: all three filters must pass (default: any 2 of 3)" },
+                ],
+              },
+            ].map(({ key, label, desc, fields, extraCheckbox, extraCheckboxes }) => {
+              const s  = form.exitStrategies?.[key] || {};
+              const on = !!s.enabled;
+              return (
+                <div key={key} style={{ borderRadius: 8, border: `0.5px solid ${on ? "#6366f1" : "var(--color-border-tertiary)"}`, padding: "12px 14px", background: on ? "#6366f108" : "transparent" }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: on ? 12 : 0 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", flex: 1 }}>
+                      <input type="checkbox" checked={on}
+                        onChange={e => setExitStrategy(key, { enabled: e.target.checked })} />
+                      <div>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: on ? "var(--color-text-primary)" : "var(--color-text-secondary)" }}>{label}</div>
+                        <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2, lineHeight: 1.5 }}>{desc}</div>
+                      </div>
+                    </label>
+                    <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, fontWeight: 600, flexShrink: 0,
+                      background: on ? "#6366f122" : "var(--color-background-secondary)",
+                      color: on ? "#6366f1" : "var(--color-text-tertiary)" }}>
+                      {on ? "ON" : "OFF"}
+                    </span>
+                  </div>
+                  {on && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {/* Numeric fields */}
+                      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                        {fields.map(f => (
+                          <label key={f.k} style={{ fontSize: 11, flex: 1, minWidth: 120 }}>
+                            <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>{f.label}</div>
+                            <input type="number" value={s[f.k] ?? ""} min={f.min} max={f.max} step={f.step}
+                              onChange={e => setExitStrategy(key, { [f.k]: e.target.value })}
+                              style={{ width: "100%", boxSizing: "border-box" }} />
+                            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>{f.hint}</div>
+                          </label>
+                        ))}
+                      </div>
+                      {/* Single extra checkbox */}
+                      {extraCheckbox && (
+                        <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11, cursor: "pointer",
+                          padding: "6px 8px", borderRadius: 6, background: "var(--color-background-secondary)" }}>
+                          <input type="checkbox" checked={!!s[extraCheckbox.k]}
+                            onChange={e => setExitStrategy(key, { [extraCheckbox.k]: e.target.checked })} />
+                          <span style={{ color: "var(--color-text-secondary)" }}>{extraCheckbox.label}</span>
+                        </label>
+                      )}
+                      {/* Multiple extra checkboxes */}
+                      {extraCheckboxes && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                          {extraCheckboxes.map(cb => (
+                            <label key={cb.k} style={{ display: "flex", alignItems: "center", gap: 7,
+                              fontSize: 11, cursor: "pointer",
+                              padding: "5px 8px", borderRadius: 6,
+                              background: s[cb.k] !== false ? "var(--color-background-secondary)" : "transparent" }}>
+                              <input type="checkbox"
+                                checked={s[cb.k] !== false}
+                                onChange={e => setExitStrategy(key, { [cb.k]: e.target.checked })} />
+                              <span style={{ color: "var(--color-text-secondary)" }}>{cb.label}</span>
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
           </div>
         )}
 
@@ -3255,74 +3773,89 @@ function getQ(table, state) {
 }
 
 // Update Q-table after trade completes (Bellman equation)
-function rlUpdate(coin, prevState, action, reward, nextState) {
+function rlUpdate(coin, prevState, action, reward, nextState, params = {}) {
   if (!rlTables[coin]) return;
+  const alpha        = parseFloat(params.alpha)        || RL_ALPHA;
+  const gamma        = parseFloat(params.gamma)        || RL_GAMMA;
+  const epsilonMin   = parseFloat(params.epsilonMin)   || RL_EPSILON_MIN;
+  const epsilonDecay = parseFloat(params.epsilonDecay) || RL_EPSILON_DECAY;
+
   const { qTable } = rlTables[coin];
   const q      = getQ(qTable, prevState);
   const qNext  = getQ(qTable, nextState);
   const maxQ   = Math.max(...qNext);
   const actionIdx = action === "BUY" ? 1 : action === "SELL" ? 2 : 0;
   // Q(s,a) ← Q(s,a) + α[r + γ·maxQ(s') - Q(s,a)]
-  q[actionIdx] = q[actionIdx] + RL_ALPHA * (reward + RL_GAMMA * maxQ - q[actionIdx]);
+  q[actionIdx] = q[actionIdx] + alpha * (reward + gamma * maxQ - q[actionIdx]);
   rlTables[coin].episodes++;
-  // Decay exploration rate
-  rlTables[coin].epsilon = Math.max(
-    RL_EPSILON_MIN,
-    rlTables[coin].epsilon * RL_EPSILON_DECAY
-  );
+  rlTables[coin].epsilon = Math.max(epsilonMin, rlTables[coin].epsilon * epsilonDecay);
 }
 
 // Get RL action for current state (epsilon-greedy)
-function rlPredict(coin, indicators, volumeRatio) {
+function rlPredict(coin, indicators, volumeRatio, params = {}) {
+  const epsilonStart = parseFloat(params.epsilonStart) || RL_EPSILON_START;
   if (!rlTables[coin]) {
-    rlTables[coin] = { qTable: new Map(), epsilon: RL_EPSILON_START, episodes: 0 };
+    rlTables[coin] = { qTable: new Map(), epsilon: epsilonStart, episodes: 0 };
   }
   const { qTable, epsilon, episodes } = rlTables[coin];
   const state = getRLState(indicators, volumeRatio);
 
-  // Store current state for later update
-  rlTables[coin].lastState = state;
+  // NOTE: do NOT overwrite lastState here — it is set only at BUY time
+  // so rlReward can update the correct entry state after the trade closes.
 
   let actionIdx;
   if (Math.random() < epsilon) {
-    // Explore: random action
     actionIdx = Math.floor(Math.random() * 3);
   } else {
-    // Exploit: best known action
     const q = getQ(qTable, state);
     actionIdx = q.indexOf(Math.max(...q));
   }
 
   const actions = ["HOLD", "BUY", "SELL"];
   const action  = actions[actionIdx];
-  const q       = getQ(qTable, state);
-  const maxQ    = Math.max(...q);
-  const minQ    = Math.min(...q);
-  const range   = maxQ - minQ || 1;
 
-  // Normalise BUY Q-value to 0–1 as directionProbability
+  // Read live Q-values from the table (not a stale snapshot)
+  const q      = getQ(qTable, state);
+  const maxQ   = Math.max(...q);
+  const minQ   = Math.min(...q);
+  const range  = maxQ - minQ || 1;
   const dirProb = (q[1] - minQ) / range;
-
-  // Confidence: how much better is the best action vs average
-  const avgQ      = (q[0] + q[1] + q[2]) / 3;
-  const confidence = Math.min(99, Math.round(Math.abs(maxQ - avgQ) / (Math.abs(maxQ) + 0.001) * 100));
+  const avgQ    = (q[0] + q[1] + q[2]) / 3;
+  const confidence = Math.min(99,
+    Math.round(Math.abs(maxQ - avgQ) / (Math.abs(maxQ) + 0.001) * 100));
 
   rlPredCache[coin] = {
     action, confidence, directionProbability: dirProb,
     episodes, epsilon: epsilon.toFixed(3), state,
-    qValues: q.map(v => v.toFixed(3)),
+    // Live Q-values — read directly from Map so they reflect latest updates
+    get qValues() {
+      const qLive = getQ(rlTables[coin]?.qTable, this.state);
+      return qLive.map(v => v.toFixed(4));
+    },
   };
   return rlPredCache[coin];
 }
 
-// Called after a trade closes — provide reward signal to the RL agent
-function rlReward(coin, action, netPnl, indicators, volumeRatio) {
+// Called when a BUY is placed — records the entry state
+// so rlReward can update the correct Q(entry_state, BUY) after the trade closes
+function rlOnBuy(coin, indicators, volumeRatio) {
+  if (!rlTables[coin]) {
+    rlTables[coin] = { qTable: new Map(), epsilon: RL_EPSILON_START, episodes: 0 };
+  }
+  // Snapshot the entry state at BUY time — NOT overwritten during the hold
+  rlTables[coin].entryState  = getRLState(indicators, volumeRatio);
+  rlTables[coin].entryAction = "BUY";
+}
+
+// Called after a trade closes — reward the BUY action taken at entry
+function rlReward(coin, netPnl, indicators, volumeRatio, params = {}) {
   if (!rlTables[coin]) return;
-  const prevState = rlTables[coin].lastState || "1111";
-  const nextState = getRLState(indicators, volumeRatio);
-  // Reward: net P&L normalised, with a small penalty for HOLD to encourage action
-  const reward = action === "HOLD" ? -0.001 : netPnl;
-  rlUpdate(coin, prevState, action, reward, nextState);
+  const rewardScale = parseFloat(params.rewardScale) || 100;
+  const entryState  = rlTables[coin].entryState || "1111";
+  const nextState   = getRLState(indicators, volumeRatio);
+  const reward      = netPnl * rewardScale;
+  rlUpdate(coin, entryState, "BUY",  reward, nextState, params);
+  rlUpdate(coin, nextState,  "SELL", reward, nextState, params);
 }
 
 // Extract feature snapshot from current indicator state
@@ -3924,11 +4457,17 @@ function useWebSocketPrices(provider, coins, enabled, onPrice, onStatusChange) {
 // Returns safe defaults if Clerk is not configured (standalone/dev mode).
 function useClerkAuth() {
   const { signOut } = useClerk();
-  const { user }    = useUser();
+  const { user, isLoaded, isSignedIn } = useUser();
+  const { session, isLoaded: sessionLoaded } = useSession();
   return {
-    clerkUser:    user   || null,
-    clerkSignOut: signOut || null,
-    clerkPlan:    user?.publicMetadata?.plan || "free",
+    clerkUser:     user      || null,
+    clerkSignOut:  signOut   || null,
+    clerkPlan:     user?.publicMetadata?.plan || "free",
+    // isLoaded = true once Clerk has fully resolved the auth state
+    // (including any account picker / subscription dialog)
+    clerkLoaded:   isLoaded && sessionLoaded,
+    clerkSignedIn: isSignedIn ?? false,
+    clerkSession:  session   || null,
   };
 }
 
@@ -3936,214 +4475,66 @@ function useClerkAuth() {
 function CryptoAlgoTrader() {
   // Clerk auth — @clerk/clerk-react must be installed (npm install @clerk/clerk-react)
   // useClerkAuth is defined just before this component (see below)
-  const { clerkUser, clerkSignOut, clerkPlan } = useClerkAuth();
+  const { clerkUser, clerkSignOut, clerkPlan, clerkLoaded, clerkSignedIn, clerkSession } = useClerkAuth();
+
+
   const planLimits = {
     free:   { maxCoins: 1,  canLive: false, canAI: false },
     pro:    { maxCoins: 10, canLive: true,  canAI: false },
     pro_ai: { maxCoins: 50, canLive: true,  canAI: true  },
   };
   const limits = planLimits[clerkPlan] || planLimits.free;
-  useEffect(() => { document.title = "Crypto Trader"; }, []);
+  useEffect(() => { document.title = "Automation Trader"; }, []);
   const [selectedCoin, setSelectedCoin] = useState("BTC");
   const [running, setRunning] = useState(false);
   const [speed, setSpeed] = useState(1500);
-  const [showSettings, setShowSettings] = useState(false);
+  const [showSettings,    setShowSettings]    = useState(false);
+  const [showMarketplace, setShowMarketplace] = useState(false);
+  // ── Theme ──────────────────────────────────────────────────────────────────
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem("automation_trader_theme") || "dark"; }
+    catch { return "dark"; }
+  });
+  const toggleTheme = () => setTheme(t => {
+    const next = t === "dark" ? "light" : "dark";
+    try { localStorage.setItem("automation_trader_theme", next); } catch (_) {}
+    return next;
+  });
+  // Sync body background when theme changes (body sits outside React root)
+  useEffect(() => {
+    document.body.style.background = theme === "dark" ? "#0f1117" : "#f0f2f5";
+    document.body.style.color      = theme === "dark" ? "#e8eaf0" : "#111827";
+  }, [theme]);
 
   // Coinbase automation state
-  const [creds, setCreds] = useState({
-    provider: "coinbase",           // active exchange
-    tradeSizeUSD:    "50",
-    balanceBuffer:   "0.50",  // deduct this from live exchange balance before trading ($)
-    minConfidence: "60",
-    feePercent:    "0.1",   // default 0.10% per trade (Binance.US maker/taker)
-    enabledCoins:  ["BTC"],
-    sandbox: false,
-    keys: {                         // per-provider API credentials
-      coinbase: { apiKeyName: "", privateKey: "" },
-      binance:  { apiKey: "", secretKey: "" },
-      kraken:   { apiKey: "", privateKey: "" },
-      gemini:   { apiKey: "", secretKey: "" },
-      alpaca:   { apiKey: "", secretKey: "" },
-      public:   { apiKey: "", secretKey: "" },
-    },
-    exitRules: {
-      BTC: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
-      ETH: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
-      SOL: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
-    },
-    exitStrategies: {
-      trailingTakeProfit: { enabled: false, trailPercent: "1.0" },
-      timeExit:        { enabled: true,  maxHoldMinutes: "30"  },
-      trailingStop:    { enabled: true,  trailPercent:   "1.5", trailDelta: "absolute" }, // "absolute"=$, "percent"=%
-      atrExit:         { enabled: false, atrMultiplier:  "1.5" },
-      volumeGate:      { enabled: true,  minVolumeRatio: "1.2" },
-      signalReversal:  { enabled: true,  reversalScore:  "-2"  },
-    },
-    cooldownMinutes: "1",
-    dynamicExits: {
-      enabled:         false,  // scale TP/SL based on cumulative P&L
-      mode:            "aggressive_when_winning", // "aggressive_when_winning" | "defensive_when_losing" | "both"
-      profitThreshold: "20",   // $ — above this cumulative profit, widen TP
-      lossThreshold:   "-20",  // $ — below this cumulative loss, tighten TP / SL
-      maxTpBoost:      "50",   // % — max increase to TP when winning (e.g. +50% wider)
-      maxTpCut:        "50",   // % — max decrease to TP when losing (e.g. -50% tighter, faster exits)
-      maxSlTighten:    "30",   // % — max decrease to SL when losing (protect capital)
-      scaleBy:         "total", // "total" (all coins) | "per_coin" (this coin's P&L only)
-    },
-    llmProvider: "deepseek",   // "deepseek" | "claude" | "gpt" | "gemini" | "llama"
-    llmKeys: {
-      deepseek: "", claude: "", gpt: "", gemini: "", llama: "",
-    },
-    agentMode: false,
-    agentIntervalSec: "15",
-    signalSource: "rules",
-    customRules: {
-      enabled: false,
-      // Each group is evaluated independently then combined with groupLogic
-      groupLogic: "and",   // "and" | "or" — how groups combine
-      groups: [
-        {
-          id: "g1",
-          customLogic: "",
-          label: "Oversold entry",
-          logic: "and",   // "and" | "or" within this group
-          action: "BUY",  // what this group signals when it passes
-          weight: 2,      // vote weight when group passes
-          conditions: [
-            { id: "c1", indicator: "rsi",    op: "<",  value: "35",  enabled: true },
-            { id: "c2", indicator: "macd",   op: ">",  value: "0",   enabled: true, combiner: "and" },
-          ],
-        },
-        {
-          id: "g2",
-          customLogic: "",
-          label: "Overbought exit signal",
-          logic: "or",
-          action: "SELL",
-          weight: 2,
-          conditions: [
-            { id: "c3", indicator: "rsi",         op: ">", value: "65",  enabled: true, combiner: "and" },
-            { id: "c4", indicator: "bollingerPct", op: ">", value: "0.9", enabled: true, combiner: "and" },
-          ],
-        },
-        {
-          id: "g3",
-          customLogic: "",
-          label: "Trailing take-profit (1% drawdown from peak)",
-          logic: "and",
-          action: "TRAILING_TAKE_PROFIT",
-          weight: 3,
-          conditions: [
-            { id: "c5", indicator: "peakProfitPct",    op: ">", value: "1.5", enabled: true, combiner: "and" },
-            { id: "c6", indicator: "drawdownFromPeak",  op: ">", value: "1.0", enabled: true, combiner: "and" },
-          ],
-        },
-        {
-          id: "g4",
-          customLogic: "",
-          label: "Time-based exit (30 min max hold)",
-          logic: "and",
-          action: "TIME_EXIT",
-          weight: 2,
-          conditions: [
-            { id: "c7", indicator: "heldMinutes", op: ">", value: "30", enabled: false, combiner: "and" },
-          ],
-        },
-        {
-          id: "g5",
-          customLogic: "",
-          label: "Signal reversal exit",
-          logic: "and",
-          action: "SIGNAL_REVERSAL",
-          weight: 2,
-          conditions: [
-            { id: "c8", indicator: "signalScore", op: "<", value: "-1", enabled: false, combiner: "and" },
-            { id: "c9", indicator: "unrealizedPct", op: ">", value: "0.5", enabled: false, combiner: "and" },
-          ],
-        },
-        {
-          id: "g6",
-          customLogic: "",
-          label: "Dynamic exit when session profitable",
-          logic: "and",
-          action: "DYNAMIC_EXIT",
-          weight: 1,
-          conditions: [
-            { id: "c10", indicator: "totalPnl",       op: ">", value: "20", enabled: false, combiner: "and" },
-            { id: "c11", indicator: "unrealizedPct",  op: ">", value: "1",  enabled: false, combiner: "and" },
-          ],
-        },
-      ],
-    },
-    ruleCombiner: {
-      logic: "and",    // "and" | "or" | "custom"
-      // custom: define per-indicator vote threshold (0.0–1.0 fraction of weighted score)
-      customThreshold: "0.3",
-      // minimum number of indicators that must agree when logic = "and"
-      minAgree: "3",
-    },
-    tradingMode: "momentum",   // "momentum" | "mean_reversion"
-    volatilityGate: {
-      enabled:       true,
-      minVolatility: "0.3",   // LSTM volatility score must exceed this
-      minAtrPct:     "0.3",   // ATR must be >= X% of price
-      minDirProb:    "0.65",  // LSTM direction probability (0.5=coin flip, 0.65=confident bull)
-    },
-    minRrRatio:    "3",        // minimum reward:risk ratio — TP must be >= N × SL
-    adaptiveSettings: {
-      enabled:       false,   // let agent auto-adjust TP/SL based on regime
-      maxTpDelta:    "2",     // max TP adjustment per session in %
-      maxSlDelta:    "1",     // max SL adjustment per session in %
-      requireHigh:   "70",   // min agent confidence to apply adjustment
-      applyAfter:    "3",    // apply only after N consistent suggestions
-    },
-    postBuyLimitSell: {
-      enabled:          false,     // place a limit sell immediately after BUY fills
-      offsetType:       "percent", // "percent" | "absolute"
-      offsetValue:      "1.5",     // place limit sell X% or $X above fill price
-      // e.g. buy fills at $65,000 → limit sell at $65,975 (1.5% above)
-      // This is a maker sell order — 0% fee on Binance.US
-    },
-    buyOrderConfig: {
-      type:             "market",   // "market" | "limit"
-      limitOffsetType:  "percent",  // "percent" | "absolute"
-      limitOffsetValue: "0.05",     // place limit X% or $X ABOVE current price (maker)
-      // 0.05% above = fills quickly, qualifies as maker on most exchanges
-      // Higher = safer maker but slower fill
-    },
-    sellOrderConfig: {
-      type:               "market",   // market | limit | stop_limit | oco | trailing_stop
-      limitOffsetType:    "percent",  // percent | absolute
-      limitOffsetValue:   "0.1",      // % or $ below signal price for limit
-      stopPricePct:       "0.5",      // % below entry for stop-limit stop trigger
-      limitPricePct:      "0.6",      // % below entry for stop-limit limit price
-      ocoTpPct:           "2",        // OCO take-profit % above entry
-      ocoSlPct:           "1",        // OCO stop-loss % below entry
-      trailStopDelta:     "1.5",      // trailing stop % delta (exchange-native)
-      trailDeltaType:     "percent",  // percent | absolute
-    },
-    tickIntervalMs: 1500,  // how often runTick fires — controls real-time span of indicator periods
-    indicatorPeriods: {
-      smaFast:   20,   // ticks
-      smaMid:    50,
-      smaSlow:   99,
-      emaFast:   12,
-      emaSlow:   26,
-      rsi:       14,
-      bollinger: 20,
-      atr:       14,
-    },
-    indicatorConfig: {
-      rsi:            { enabled: true,  weight: "2",   oversold: "35",  overbought: "65" },
-      sma_20_50:      { enabled: true,  weight: "1.5", fast: "20",     slow: "50"  },
-      sma_20_99:      { enabled: false, weight: "2",   fast: "20",     slow: "99"  },
-      sma_50_99:      { enabled: false, weight: "1.5", fast: "50",     slow: "99"  },
-      ema_12_26:      { enabled: false, weight: "1.5", fast: "12",     slow: "26"  },
-      macd:           { enabled: true,  weight: "1"   },
-      bollinger:      { enabled: true,  weight: "2",   period: "20"  },
-      news:           { enabled: true,  weight: "1.5" },
-    },
+  const CREDS_STORAGE_KEY = "automation_trader_creds";
+  const [creds, setCreds] = useState(() => {
+    // Restore settings from last browser session — avoids losing settings on tab close.
+    // CREDS_DEFAULTS is defined at module level (outside this component) so it's
+    // always available when this initialiser runs.
+    try {
+      const saved = localStorage.getItem(CREDS_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        // Merge over defaults so new fields added in code are still present
+        return { ...CREDS_DEFAULTS, ...parsed };
+      }
+    } catch (_) {}
+    return { ...CREDS_DEFAULTS };
   });
+
+  // Save creds to localStorage whenever they change
+  useEffect(() => {
+    try {
+      // Strip API keys — they stay in Cloud Run env vars only, not localStorage
+      const { keys, ...safeToStore } = creds;
+      localStorage.setItem(CREDS_STORAGE_KEY, JSON.stringify(safeToStore));
+    } catch (_) {}
+  }, [creds]);
+
+  // ↓ CREDS_DEFAULTS is at module level — see above useState initialiser for context
+  void 0;
+  // CREDS_DEFAULTS defined at module level above this component
 
   // Sync tick speed with creds.tickIntervalMs whenever settings change
   useEffect(() => {
@@ -4164,8 +4555,96 @@ function CryptoAlgoTrader() {
   const [agentLog,     setAgentLog]     = useState([]);
   const agentDecisionRef   = useRef(null);
   const [txLog, setTxLog]       = useState([]);
-  const sessionBalanceRef         = useRef(null);  // running balance (compounds with P&L)
-  const [sessionBalance, setSessionBalance] = useState(null); // null = not started yet
+  const sessionBalanceRef          = useRef(null);
+  // Tracks the balance at the moment the CURRENT run began (fresh start or resume)
+  // so "from start" reflects change since this run, not since the session's genesis.
+  const sessionStartBalanceRef     = useRef(null);
+  const [sessionBalance, setSessionBalance]   = useState(null);
+  // ── Trading server (VPS) multi-session state ────────────────────────────────
+  const [serverSessions, setServerSessions]   = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [serverStatus,  setServerStatus]      = useState("unknown");
+  const serverPollRef                         = useRef(null);
+  const [showResumeBar, setShowResumeBar]     = useState(false);
+  const [showSessionMgr, setShowSessionMgr]  = useState(false);
+  const [sessionMgrTab,  setSessionMgrTab]   = useState("test"); // "test" | "live"
+  const [newSessionName, setNewSessionName]  = useState("");
+  const [newSessionMode, setNewSessionMode]  = useState("simulation");
+  // Coin allocation inputs for new session form (component-level to avoid hook-in-IIFE crash)
+  const [newCoinAllocs, setNewCoinAllocs]    = useState({});
+  const [newSessionStarting, setNewSessionStarting] = useState(false);
+  const [newSessionError,    setNewSessionError]    = useState("");
+  // Inline paper save name in session manager
+  const [paperInlineName,   setPaperInlineName]   = useState("");
+  const serverSession = serverSessions.find(s => (s.sessionId || s.session_id) === activeSessionId) || null;
+
+  // ── Paper session persistence (optional, requires login + Supabase) ─────────
+  const [paperSessions,        setPaperSessions]        = useState([]);
+  const [paperSaving,          setPaperSaving]          = useState(false);
+  const [paperSaveMsg,         setPaperSaveMsg]         = useState("");
+  const [activePaperSessionId,   setActivePaperSessionId]   = useState(null);
+  const [activePaperSessionName, setActivePaperSessionName] = useState("");
+  const autoSaveIntervalRef    = useRef(null);
+  // Session viewer — shows a saved session in read-only mode without resuming it
+  const [viewingSession, setViewingSession] = useState(null); // { name, snapshot } | null
+  // Drawer visibility is SEPARATE from viewing state — closing the drawer
+  // should not exit "viewing" mode and revert the dashboard to live data.
+  // Only the context bar's × (or Resume/Stop) exits viewing mode.
+  const [showViewerDrawer, setShowViewerDrawer] = useState(true);
+
+  // ── Onboarding tour state ────────────────────────────────────────────────
+  const [tourActive, setTourActive] = useState(false);
+  const [tourStep,   setTourStep]   = useState(0);
+  const [tourForcedTab, setTourForcedTab] = useState(null); // forces SettingsModal tab during tour
+  const TOUR_SEEN_KEY = "automation_trader_tour_seen";
+
+  // Auto-launch the tour once for first-time visitors
+  useEffect(() => {
+    try {
+      if (!localStorage.getItem(TOUR_SEEN_KEY)) {
+        const t = setTimeout(() => setTourActive(true), 800); // let the page settle first
+        return () => clearTimeout(t);
+      }
+    } catch (_) {}
+  }, []);
+
+  // Filter out steps whose target won't exist yet (e.g. no saved sessions)
+  const visibleTourSteps = TOUR_STEPS.filter(s => {
+    if (!s.optional) return true;
+    if (s.target === "[data-tour='session-eye-icon']") return paperSessions.length > 0;
+    return true;
+  });
+
+  // Run the side effect each step needs BEFORE it can be measured/highlighted —
+  // opening Settings, switching its internal tab, or closing Settings again.
+  useEffect(() => {
+    if (!tourActive) return;
+    const step = visibleTourSteps[tourStep];
+    if (!step?.requires) return;
+    if (step.requires === "openSettings") {
+      setShowSettings(true);
+    } else if (step.requires.startsWith("settingsTab:")) {
+      setShowSettings(true);
+      setTourForcedTab(step.requires.split(":")[1]);
+    } else if (step.requires === "closeSettings") {
+      setShowSettings(false);
+      setTourForcedTab(null);
+    }
+  }, [tourActive, tourStep]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const endTour = () => {
+    setTourActive(false);
+    setTourStep(0);
+    setTourForcedTab(null);
+    try { localStorage.setItem(TOUR_SEEN_KEY, "1"); } catch (_) {}
+  };
+
+  // Saved simulation snapshots — stored in localStorage, named configs for quick recall
+  const [savedSims, setSavedSims]     = useState(() => {
+    try { return JSON.parse(localStorage.getItem("algotrader_saved_sims") || "{}"); } catch { return {}; }
+  });
+  const [showSavedSims, setShowSavedSims] = useState(false);
+  const [simSaveName,   setSimSaveName]   = useState("");
   const adaptivePendingRef  = useRef({});
   const [adaptiveState, setAdaptiveState] = useState({});
   // LSTM state
@@ -4232,9 +4711,521 @@ function CryptoAlgoTrader() {
 
   const addAutoLog = useCallback((msg, type = "info") => {
     const id = autoLogIdRef.current++;
-    const time = new Date().toLocaleTimeString();
+    const time = fmtTime(new Date());
     setAutoLog((prev) => [{ id, msg, type, time }, ...prev.slice(0, 49)]);
   }, []);
+
+  // ── Trading server (VPS) integration ─────────────────────────────────────────
+  // authFetch with trading server URL
+  const serverFetch = useCallback(async (path, opts = {}) => {
+    if (!TRADING_SERVER) return null;
+    // Wait up to 5s for Clerk to resolve the session before giving up
+    let token = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      token = await window.Clerk?.session?.getToken().catch(() => null);
+      if (token) break;
+      if (attempt < 9) await new Promise(r => setTimeout(r, 500));
+    }
+    const res = await fetch(`${TRADING_SERVER}${path}`, {
+      ...opts,
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...opts.headers,
+      },
+    });
+    // Surface auth failures clearly so we don't silently swallow 401s
+    if (res.status === 401) {
+      console.warn("[serverFetch] 401 Unauthorized for", path,
+        "— Clerk token was", token ? "present" : "MISSING",
+        "— Clerk session:", window.Clerk?.session?.id ?? "null");
+    }
+    return res;
+  }, []);
+
+  // Fetch all sessions from VPS
+  // Use a ref for state values needed inside the poll to avoid recreating the interval
+  const runningRef        = useRef(running);
+  const autoEnabledRef    = useRef(autoEnabled);
+  const activeSessionIdRef = useRef(activeSessionId);
+  useEffect(() => { runningRef.current        = running;        }, [running]);
+  useEffect(() => { autoEnabledRef.current    = autoEnabled;    }, [autoEnabled]);
+  useEffect(() => { activeSessionIdRef.current = activeSessionId; }, [activeSessionId]);
+
+  const fetchServerSessions = useCallback(async () => {
+    if (!TRADING_SERVER) { setServerStatus("not_configured"); return; }
+    try {
+      const res = await serverFetch("/sessions");
+      if (!res) return;
+      if (res.status === 401) {
+        console.warn("[fetchServerSessions] 401 — Clerk session not ready yet");
+        setServerStatus("auth_pending");
+        return;
+      }
+      if (!res.ok) {
+        console.error("[fetchServerSessions] HTTP", res.status, res.statusText);
+        setServerStatus("error");
+        return;
+      }
+      const data = await res.json();
+
+      const list = (data.sessions || [])
+        .map(s => ({
+          ...s,
+          // Normalise all snake_case DB fields to camelCase
+          sessionId:       s.sessionId       || s.session_id,
+          name:            s.name            || s.session_name,
+          coinBalances:    s.coinBalances    || s.coin_balances    || {},
+          pnl:             s.pnl             || s.pnl_by_coin      || {},
+          unrealized:      s.unrealized      || s.unrealized_by_coin || {},
+          tradesByCoin:    s.tradesByCoin    || s.trades_by_coin   || {},
+          credsSnapshot:   s.credsSnapshot   || s.creds_snapshot   || {},
+          totalTrades:     s.totalTrades     || s.total_trades      || 0,
+        }));
+        // Include both simulation and live sessions.
+        // The session manager separates them visually by tab.
+      setServerSessions(list);
+
+      const anyRunning     = list.some(s => s.running);
+      const runningSession = list.find(s => s.running);
+      const hasResumable   = list.some(s => !s.running && s.sessionId);
+      setServerStatus(anyRunning ? "running" : hasResumable ? "stopped" : "idle");
+
+      // Show resume banner when sessions exist and browser isn't actively trading
+      if ((runningSession || hasResumable) && !runningRef.current && !autoEnabledRef.current) {
+        setShowResumeBar(true);
+      }
+      // Auto-select first running session if none selected
+      if (runningSession && !activeSessionIdRef.current) {
+        setActiveSessionId(runningSession.sessionId);
+      }
+      // Restore creds from the active running session so the dashboard
+      // reflects the settings that session is actually using
+      if (runningSession?.credsSnapshot && Object.keys(runningSession.credsSnapshot).length > 0) {
+        setCreds(prev => ({
+          ...prev,
+          ...runningSession.credsSnapshot,
+          keys: prev.keys,  // always keep local keys
+        }));
+      }
+
+      // Sync logs + balance from active session
+      const curActiveId = activeSessionIdRef.current;
+      if (curActiveId) {
+        const active = list.find(s => s.sessionId === curActiveId);
+        if (active?.running) {
+          // Compute total balance across all coins from coinBalances
+          const coinBals = active.coinBalances || active.coin_balances || {};
+          const totalBal = Object.values(coinBals).reduce((sum, b) => sum + (parseFloat(b.current) || 0), 0);
+          if (totalBal > 0) { sessionBalanceRef.current = totalBal; setSessionBalance(totalBal); }
+          if (active.logs?.length) {
+            setAutoLog(prev => {
+              const existing = new Set(prev.map(l => l.msg));
+              const fresh = active.logs
+                .filter(l => !existing.has(l.msg))
+                .map(l => ({ id: Math.random(), msg: l.msg, type: l.type,
+                  time: fmtTime(new Date(l.ts)) }));
+              return [...fresh, ...prev].slice(0, 50);
+            });
+          }
+        }
+      }
+    } catch (e) {
+      setServerStatus("error");
+      console.warn("[trading-server] fetch failed:", e.message);
+    }
+  }, [serverFetch]); // stable deps only — state read via refs
+
+  // Wait for Clerk to resolve before fetching sessions.
+  // Clerk's subscription dialog (if shown) blocks session.getToken() — firing
+  // before it resolves causes 401s which silently suppress all session data.
+  useEffect(() => {
+    if (!TRADING_SERVER) return;
+    if (!clerkLoaded) return;   // wait for Clerk to finish resolving
+    // Initial fetch + recurring poll
+    fetchServerSessions();
+    clearInterval(serverPollRef.current);
+    serverPollRef.current = setInterval(fetchServerSessions, 3000);
+    return () => clearInterval(serverPollRef.current);
+  }, [clerkLoaded, fetchServerSessions]); // restart when Clerk becomes ready
+
+  // Create a new VPS session
+  const startServerSession = useCallback(async (name, mode, coinAllocations) => {
+    if (!TRADING_SERVER) return false;
+    try {
+      const res  = await serverFetch("/sessions", {
+        method: "POST",
+        body:   JSON.stringify({ creds, name: name || "Session", mode: mode || "simulation", coinAllocations }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Start failed");
+      setActiveSessionId(data.sessionId);
+      addAutoLog(`▶ "${data.name}" session started (${data.mode})`, "success");
+      fetchServerSessions(); // refresh list — non-blocking
+      return data.sessionId;
+    } catch (e) {
+      addAutoLog(`Server session failed: ${e.message}`, "error");
+      return false;
+    }
+  }, [creds, serverFetch, addAutoLog, fetchServerSessions]);
+
+  // Stop a specific session
+  const stopServerSession = useCallback(async (sessionId) => {
+    if (!TRADING_SERVER) return;
+    const sid = sessionId || activeSessionIdRef.current;
+    if (!sid) return;
+    try {
+      await serverFetch(`/sessions/${sid}`, { method: "DELETE" });
+      addAutoLog("⏹ Server session stopped", "warn");
+      if (sid === activeSessionIdRef.current) setActiveSessionId(null);
+      setShowResumeBar(false);
+      fetchServerSessions();
+    } catch (e) {
+      addAutoLog(`Stop failed: ${e.message}`, "error");
+    }
+  }, [serverFetch, addAutoLog, fetchServerSessions]);
+
+  // Resume a stopped session from DB
+  const resumeServerSession = useCallback(async (sessionId) => {
+    if (!TRADING_SERVER || !sessionId) return;
+    try {
+      addAutoLog(`📡 Resuming session...`, "info");
+      const res  = await serverFetch(`/sessions/${sessionId}/resume`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Resume failed");
+      setActiveSessionId(sessionId);
+      addAutoLog(`✅ Resumed "${data.name || sessionId}"`, "success");
+      fetchServerSessions();
+    } catch (e) {
+      addAutoLog(`Resume failed: ${e.message}`, "error");
+    }
+  }, [serverFetch, addAutoLog, fetchServerSessions]);
+
+  // ── Paper session helpers ────────────────────────────────────────────────────
+  // Fetch saved paper sessions from Supabase via proxy
+  const fetchPaperSessions = useCallback(async () => {
+    try {
+      const token = await window.Clerk?.session?.getToken();
+      if (!token) return; // not logged in
+      const res = await fetch(`${PROXY_BASE}/paper-sessions`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      setPaperSessions(data.sessions || []);
+    } catch (_) {}
+  }, []); // no deps — uses Clerk session directly, stable
+
+  // Load paper sessions on mount
+  useEffect(() => { fetchPaperSessions(); }, []);
+
+  // Also refresh paper sessions whenever session manager opens
+  useEffect(() => {
+    if (showSessionMgr) fetchPaperSessions();
+  }, [showSessionMgr, fetchPaperSessions]);
+
+  // Build a full snapshot of current paper trading state for saving
+  const buildPaperSnapshot = useCallback((stopped = false) => ({
+    creds,
+    // stopped: true only when the user explicitly clicked Stop.
+    // false means this snapshot was taken while the session was still
+    // actively running (periodic auto-save) — the browser may have simply
+    // closed afterward without a clean stop, so treat it as "still active".
+    stopped,
+    enabledCoins:   creds.enabledCoins || ["BTC"],
+    signalSource:   creds.signalSource || "rules",
+    sessionBalance: sessionBalanceRef.current,
+    coinBalances:   Object.fromEntries(
+      (creds.enabledCoins || ["BTC"]).map(c => {
+        const cs = stateRef.current?.[c];
+        return [c, { current: sessionBalanceRef.current || 50, allocated: parseFloat(creds.tradeSizeUSD)||50 }];
+      })
+    ),
+    positions:    Object.fromEntries(
+      (creds.enabledCoins || ["BTC"]).map(c => [c, stateRef.current?.[c]?.position || null])
+    ),
+    pnlByCoin:    Object.fromEntries(
+      (creds.enabledCoins || ["BTC"]).map(c => [c, stateRef.current?.[c]?.pnl || 0])
+    ),
+    tradesByCoin: Object.fromEntries(
+      (creds.enabledCoins || ["BTC"]).map(c => [c, stateRef.current?.[c]?.trades || 0])
+    ),
+    totalTrades:  Object.values(stateRef.current || {}).reduce((s,c) => s + (c.trades||0), 0),
+    rlTables:     serializeRLForSave(),
+    logs:         autoLog.slice(0, 30),
+  }), [creds, autoLog]);
+
+  // Safe RL serialization — sanitises Infinity/NaN which break JSON.stringify
+  function serializeRLForSave() {
+    try {
+      const sanitize = (v) => {
+        if (typeof v !== "number") return v;
+        if (!isFinite(v) || isNaN(v)) return 0;
+        return parseFloat(v.toFixed(6)); // trim floating point noise
+      };
+      const out = {};
+      for (const coin of (creds.enabledCoins || ["BTC"])) {
+        const t = rlTables[coin];
+        if (!t) continue;
+        const qTableObj = {};
+        (t.qTable || new Map()).forEach((vals, state) => {
+          qTableObj[state] = (vals || [0,0,0]).map(sanitize);
+        });
+        out[coin] = {
+          epsilon:  sanitize(t.epsilon  ?? 0.4),
+          episodes: t.episodes || 0,
+          qTable:   qTableObj,
+        };
+      }
+      return out;
+    } catch (_) { return {}; }
+  }
+
+  // Safe JSON stringify — replaces Infinity/NaN with null
+  function safeStringify(obj) {
+    return JSON.stringify(obj, (_, v) => {
+      if (typeof v === "number" && (!isFinite(v) || isNaN(v))) return null;
+      return v;
+    });
+  }
+
+  // Save current paper session to Supabase
+  const savePaperSession = useCallback(async (name, sessionId = null, stopped = false) => {
+    if (autoEnabled) return; // don't save live trading as a paper session
+    setPaperSaving(true);
+    setPaperSaveMsg("");
+    try {
+      const token = await window.Clerk?.session?.getToken();
+      if (!token) throw new Error("Please sign in to save sessions");
+      const snapshot = buildPaperSnapshot(stopped);
+      const id = sessionId || crypto.randomUUID();
+      const res = await fetch(`${PROXY_BASE}/paper-sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: safeStringify({ sessionId: id, name, snapshot }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Save failed");
+      const sid = data.sessionId || id;
+      // Track which session is currently active for auto-save
+      setActivePaperSessionId(sid);
+      setActivePaperSessionName(name);
+      setPaperSaveMsg(`✓ Saved "${name}"`);
+      fetchPaperSessions();
+      setTimeout(() => setPaperSaveMsg(""), 3000);
+      return sid;
+    } catch (e) {
+      setPaperSaveMsg(`✗ ${e.message}`);
+      setTimeout(() => setPaperSaveMsg(""), 4000);
+    } finally {
+      setPaperSaving(false);
+    }
+  }, [autoEnabled, buildPaperSnapshot, fetchPaperSessions]);
+
+  // Resume a saved paper session — restores all state into the browser
+  const resumePaperSession = useCallback(async (session) => {
+    const snap = session.snapshot || session;
+    if (!snap.creds) return;
+
+    // Restore settings
+    setCreds(snap.creds);
+
+    // Restore balance
+    const bal = snap.sessionBalance || 50;
+    sessionBalanceRef.current = bal;
+    setSessionBalance(bal);
+    // Baseline for "from start" — resets to the resumed balance so the diff
+    // reflects change since THIS resume, not since the session began originally
+    sessionStartBalanceRef.current = bal;
+
+    // Restore settings (creds) from the snapshot so the session runs with
+    // the exact same signal config, exit rules, indicators etc. that were
+    // active when it was last saved. Merge over current creds so API keys
+    // (which are never stored in snapshots) are preserved from the browser.
+    if (snap.creds && Object.keys(snap.creds).length > 0) {
+      setCreds(prev => ({
+        ...prev,          // keep API keys and any fields not in snapshot
+        ...snap.creds,    // restore signal config, exit rules, coins, etc.
+        keys: prev.keys,  // always keep current keys — never overwrite from snapshot
+      }));
+    }
+
+    // Restore P&L, positions, trades in stateRef
+    for (const coin of (snap.enabledCoins || ["BTC"])) {
+      if (!stateRef.current[coin]) continue;
+      if (snap.pnlByCoin?.[coin] != null)    stateRef.current[coin].pnl    = snap.pnlByCoin[coin];
+      if (snap.tradesByCoin?.[coin] != null)  stateRef.current[coin].trades = snap.tradesByCoin[coin];
+      if (snap.positions?.[coin] != null)     stateRef.current[coin].position = snap.positions[coin];
+    }
+
+    // Restore RL Q-tables
+    if (snap.rlTables) {
+      for (const [coin, t] of Object.entries(snap.rlTables)) {
+        rlTables[coin] = {
+          epsilon:  t.epsilon  ?? 0.4,
+          episodes: t.episodes ?? 0,
+          qTable:   new Map(Object.entries(t.qTable || {})),
+        };
+      }
+    }
+
+    // Restore logs
+    if (snap.logs?.length) {
+      setAutoLog(snap.logs.map((l, i) => ({
+        id: i, msg: l.msg || l, type: l.type || "info",
+        time: l.time || fmtTime(new Date(l.ts || Date.now())),
+      })));
+    }
+
+    // Track this as the active session so auto-save updates the right record
+    setActivePaperSessionId(session.session_id || session.sessionId);
+    setActivePaperSessionName(session.name);
+
+    // Reset price/indicator history so charts build fresh from real market data
+    // (saved snapshots don't include tick-level prices — only final P&L and position)
+    for (const coin of (snap.enabledCoins || ["BTC"])) {
+      if (!stateRef.current[coin]) continue;
+      // Keep the last known real price as the new seed (never collapse to empty array)
+      const lastPrice = stateRef.current[coin].prices.at(-1) || COIN_BASE[coin] || 1;
+      stateRef.current[coin].prices  = [lastPrice];
+      stateRef.current[coin].volumes = [1];
+      stateRef.current[coin].history = [];
+    }
+
+    // Clear viewing state — the session is now RUNNING, not being viewed as a snapshot
+    setViewingSession(null);
+    setShowViewerDrawer(true);
+
+    // Start the paper trading loop
+    setWsEnabled(true);
+    setRunning(true);
+    const wasStopped = snap.stopped === true;
+    addAutoLog(
+      wasStopped
+        ? `📂 Resumed "${session.name}" — bal $${bal.toFixed(2)} · charts will fill as prices arrive`
+        : `📂 Continuing "${session.name}" — bal $${bal.toFixed(2)} · charts will fill as prices arrive`,
+      "success"
+    );
+    setShowSessionMgr(false);
+  }, [addAutoLog]);
+
+  // ── Auto-save active paper session every 5 minutes ─────────────────────────
+  const AUTO_SAVE_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+  useEffect(() => {
+    // Only auto-save when:
+    // 1. Paper trading is running (not live)
+    // 2. User has a named active session to save into
+    // 3. User is logged in (Clerk session available)
+    if (!running || autoEnabled || !activePaperSessionId) {
+      clearInterval(autoSaveIntervalRef.current);
+      autoSaveIntervalRef.current = null;
+      return;
+    }
+
+    // Start auto-save interval
+    autoSaveIntervalRef.current = setInterval(async () => {
+      const token = await window.Clerk?.session?.getToken();
+      if (!token) return; // not logged in — skip silently
+      // stopped: false — this snapshot is taken WHILE the session is still
+      // actively running. If the browser closes right after, the last known
+      // state correctly reflects "was still running" rather than "stopped".
+      const snapshot = buildPaperSnapshot(false);
+      const id = activePaperSessionId;
+      const name = activePaperSessionName || "Paper session";
+      try {
+        await fetch(`${PROXY_BASE}/paper-sessions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: safeStringify({ sessionId: id, name, snapshot }),
+        });
+        // Subtle indicator — don't flash the full save message for auto-saves
+        setPaperSaveMsg(`⟳ Auto-saved ${fmtTime(new Date())}`);
+        setTimeout(() => setPaperSaveMsg(""), 2000);
+        fetchPaperSessions();
+      } catch (_) {} // auto-save failure is silent
+    }, AUTO_SAVE_INTERVAL_MS);
+
+    // Cleanup on stop or unmount
+    return () => {
+      clearInterval(autoSaveIntervalRef.current);
+      autoSaveIntervalRef.current = null;
+    };
+  }, [running, autoEnabled, activePaperSessionId, activePaperSessionName,
+      buildPaperSnapshot, fetchPaperSessions]);
+
+  // Save immediately when paper trading stops (captures final state).
+  // This only fires when the user explicitly clicks Stop — closing the
+  // browser tab does not run React effects, so a session that was simply
+  // closed (not stopped) keeps its last auto-saved stopped:false state.
+  useEffect(() => {
+    if (!autoEnabled && !running && activePaperSessionId) {
+      const t = setTimeout(() => {
+        savePaperSession(activePaperSessionName || "Paper session", activePaperSessionId, true);
+        setActivePaperSessionId(null);
+        setActivePaperSessionName("");
+      }, 500);
+      return () => clearTimeout(t);
+    }
+  }, [running]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Delete a saved paper session
+  const deletePaperSession = useCallback(async (sessionId) => {
+    try {
+      const token = await window.Clerk?.session?.getToken();
+      if (!token) return;
+      await fetch(`${PROXY_BASE}/paper-sessions/${sessionId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      await fetchPaperSessions();
+    } catch (_) {}
+  }, [fetchPaperSessions]);
+
+  // Push settings to active running session when creds change
+  useEffect(() => {
+    if (!TRADING_SERVER || !activeSessionId || serverStatus !== "running") return;
+    const timer = setTimeout(async () => {
+      try {
+        await serverFetch(`/sessions/${activeSessionId}`, {
+          method: "PUT",
+          body:   JSON.stringify({ creds }),
+        });
+      } catch (_) {}
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [creds, activeSessionId, serverStatus, serverFetch]);
+
+  // ── Simulation settings save / load ──────────────────────────────────────────
+  // Declared here (after addAutoLog) to avoid forward reference error
+  const saveSimulation = useCallback((name) => {
+    if (!name?.trim()) return;
+    const snapshot = {
+      name: name.trim(), savedAt: fmtDateTime(new Date()),
+      creds: JSON.parse(JSON.stringify(creds)),
+      sessionBalance: sessionBalanceRef.current,
+      totalPnl: Object.values(stateRef.current).reduce((s,c) => s + (c.pnl||0), 0),
+    };
+    const updated = { ...savedSims, [name.trim()]: snapshot };
+    setSavedSims(updated);
+    try { localStorage.setItem("algotrader_saved_sims", JSON.stringify(updated)); } catch(_){}
+    addAutoLog(`💾 Simulation "${name.trim()}" saved`, "success");
+    setSimSaveName("");
+  }, [creds, savedSims, addAutoLog]);
+
+  const loadSimulation = useCallback((name) => {
+    const sim = savedSims[name]; if (!sim) return;
+    setCreds(sim.creds);
+    addAutoLog(`📂 Simulation "${name}" loaded`, "info");
+    setShowSavedSims(false);
+  }, [savedSims, addAutoLog]);
+
+  const deleteSimulation = useCallback((name) => {
+    const updated = { ...savedSims };
+    delete updated[name];
+    setSavedSims(updated);
+    try { localStorage.setItem("algotrader_saved_sims", JSON.stringify(updated)); } catch(_){}
+  }, [savedSims]);
 
   // ── Fetch real news from NewsData.io via proxy ───────────────────────────────
   const fetchRealNews = useCallback(async () => {
@@ -4301,7 +5292,7 @@ function CryptoAlgoTrader() {
         sentiment: a.sentiment,
         sentimentLabel: a.sentimentLabel,
         time: a.publishedAt
-          ? new Date(a.publishedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          ? fmtTime(new Date(a.publishedAt))
           : "now",
       }));
 
@@ -4326,7 +5317,7 @@ function CryptoAlgoTrader() {
   // ── Fetch prices: direct fetch when top-level, bridge when in iframe ──────────
   // providerId is passed in so prices always come from the active exchange
   const fetchViaBridge = useCallback((isAnchor = false, providerId = "coinbase") => {
-    setPriceSourceStatus((p) => ({ ...p, fetching: true, lastAttempt: new Date().toLocaleTimeString() }));
+    setPriceSourceStatus((p) => ({ ...p, fetching: true, lastAttempt: fmtDateTime(new Date()) }));
 
     if (!inIframe) {
       // Top-level page — fetch directly, no CSP restriction
@@ -4378,8 +5369,8 @@ function CryptoAlgoTrader() {
     if (anyOk) setSnapshot(JSON.parse(JSON.stringify(s)));
     setPriceSourceStatus({
       fetching: false, ok: anyOk, diags,
-      lastSuccess: anyOk ? new Date().toLocaleTimeString() : null,
-      lastAttempt: new Date().toLocaleTimeString(),
+      lastSuccess: anyOk ? fmtDateTime(new Date()) : null,
+      lastAttempt: fmtDateTime(new Date()),
     });
   }, []);
 
@@ -4392,7 +5383,7 @@ function CryptoAlgoTrader() {
         const diags = {};
         COINS.forEach(c => { diags[c] = { ok: false, errorType: "network", errorMsg: msg }; });
         setPriceSourceStatus(p => ({ ...p, fetching: false, ok: false, diags,
-          lastAttempt: new Date().toLocaleTimeString() }));
+          lastAttempt: fmtDateTime(new Date()) }));
         return;
       }
       // Parse the proxy payload
@@ -4575,7 +5566,7 @@ function CryptoAlgoTrader() {
                   : currentSl;
                 addAutoLog(`[ADAPTIVE] ${coin} TP ${currentTp.toFixed(2)}%→${newTp.toFixed(2)}% SL ${currentSl.toFixed(2)}%→${newSl.toFixed(2)}%`, "info");
                 pending.tp = []; pending.sl = []; // reset after applying
-                setAdaptiveState(a => ({ ...a, [coin]: { tp: newTp, sl: newSl, appliedAt: new Date().toLocaleTimeString() } }));
+                setAdaptiveState(a => ({ ...a, [coin]: { tp: newTp, sl: newSl, appliedAt: fmtDateTime(new Date()) } }));
                 return {
                   ...prev,
                   exitRules: {
@@ -4589,7 +5580,7 @@ function CryptoAlgoTrader() {
 
           // Log to agent panel
           setAgentLog(prev => [{
-            coin, time: new Date().toLocaleTimeString(),
+            coin, time: fmtDateTime(new Date()),
             action: decision.action, confidence: decision.confidence,
             reasoning: decision.reasoning, keyFactors: decision.keyFactors,
             risk: decision.risk, score: decision.score,
@@ -5049,6 +6040,7 @@ function CryptoAlgoTrader() {
       setAutoStatus("live");
       const initBalLive = parseFloat(creds.tradeSizeUSD) || 50;
       sessionBalanceRef.current = initBalLive;
+      sessionStartBalanceRef.current = initBalLive;
       setSessionBalance(initBalLive);
       setWsEnabled(true);
       setAutoEnabled(true);
@@ -5156,7 +6148,7 @@ function CryptoAlgoTrader() {
       setExchangeState({
         positions: data.positions || {},
         fills:     data.fills     || [],
-        syncedAt:  new Date().toLocaleTimeString(),
+        syncedAt:  fmtDateTime(new Date()),
       });
 
       // Reconcile local position state with exchange reality
@@ -5222,6 +6214,12 @@ function CryptoAlgoTrader() {
     agentDecisionRef.current = null;
     sessionBalanceRef.current = null;
     setSessionBalance(null);
+    // Reset RL Q-tables if configured
+    if (creds.rlParams?.resetOnStop !== false) {
+      COINS.forEach(c => { if (rlTables[c]) delete rlTables[c]; });
+      Object.keys(rlPredCache).forEach(c => delete rlPredCache[c]);
+      addAutoLog("🎮 RL Q-tables reset", "info");
+    }
     addAutoLog("Live trading stopped", "warn");
   }, [addAutoLog]);
 
@@ -5230,7 +6228,7 @@ function CryptoAlgoTrader() {
     const entry = {
       id:          Date.now(),
       timestamp:   new Date().toISOString(),
-      time:        new Date().toLocaleTimeString(),
+      time:        fmtTime(new Date()),
       mode:        autoEnabled ? (creds.sandbox ? "sandbox" : "live") : "simulation",
       type,                          // BUY | SELL
       coin,
@@ -5333,7 +6331,7 @@ function CryptoAlgoTrader() {
         try { updateRF(coin, cs.prices, indicators, volumeRatio); } catch (_) {}
       }
       // RL agent: epsilon-greedy Q-learning, updates every tick
-      try { rlPredict(coin, indicators, volumeRatio); } catch (_) {}
+      try { rlPredict(coin, indicators, volumeRatio, creds.rlParams); } catch (_) {}
 
       // ── Signal source routing ─────────────────────────────────────────────────
       const src = creds.signalSource || "rules";
@@ -5379,7 +6377,8 @@ function CryptoAlgoTrader() {
       // RL signal from Q-learning agent
       const rlCache  = rlPredCache[coin];
       const rlProb   = rlCache?.directionProbability ?? 0.5;
-      const rlSignal = (src === "rl") && rlCache && rlCache.episodes >= RL_MIN_EPISODES ? {
+      const rlMinEp  = parseInt(creds.rlParams?.minEpisodes) || RL_MIN_EPISODES;
+      const rlSignal = (src === "rl") && rlCache && rlCache.episodes >= rlMinEp ? {
         action:         rlCache.action,
         confidence:     String(rlCache.confidence),
         score:          rlCache.action === "BUY" ? "2" : rlCache.action === "SELL" ? "-2" : "0",
@@ -5495,14 +6494,91 @@ function CryptoAlgoTrader() {
           : direction === "up" ? entryPrice + scaledV : entryPrice - scaledV;
       };
 
+      // ATR — needed by both the trend/ATR block below and later gate checks
+      const atr = calcATR(cs.prices, 14);
+
+      // ── Trend alignment gate ─────────────────────────────────────────────────
+      // Checks MTF confluence: only allow BUY when the higher timeframes agree
+      // with the short-term signal direction. Prevents trading against the trend.
+      const taCfg = creds.exitStrategies?.trendAlignment;
+      let trendAlignOk = true;
+      let trendAlignDetails = {};
+      if (taCfg?.enabled) {
+        // 1h trend: price above SMA50 on 1-hour timeframe
+        const sma50_1h  = indicators["sma50_1h"];
+        const bullish1h = sma50_1h ? newPrice > sma50_1h : true; // pass if no data yet
+        // 15m momentum: EMA12 > EMA26 on 15-minute timeframe
+        const ema12_15m = indicators["ema12_15m"];
+        const ema26_15m = indicators["ema26_15m"];
+        const bullish15m = (ema12_15m && ema26_15m) ? ema12_15m > ema26_15m : true;
+        // 1h RSI: not in a strong downtrend (RSI above threshold)
+        const rsi_1h    = indicators["rsi_1h"];
+        const rsiFloor  = parseFloat(taCfg.requireRsiAbove) || 45;
+        const rsiOk     = rsi_1h ? rsi_1h >= rsiFloor : true;
+
+        trendAlignDetails = {
+          bullish1h, bullish15m, rsiOk,
+          sma50_1h: sma50_1h?.toFixed(2), rsi_1h: rsi_1h?.toFixed(1),
+          ema12_15m: ema12_15m?.toFixed(2), ema26_15m: ema26_15m?.toFixed(2),
+        };
+
+        const passCount = [
+          !taCfg.requireBullish1h  || bullish1h,
+          !taCfg.requireBullish15m || bullish15m,
+          rsiOk,
+        ].filter(Boolean).length;
+
+        // Strict mode: all 3 must pass. Normal mode: 2 of 3
+        trendAlignOk = taCfg.strictMode ? passCount === 3 : passCount >= 2;
+      }
+
+      // ── ATR-based dynamic TP/SL ───────────────────────────────────────────────
+      // Replaces fixed-% TP/SL with ATR × multiplier targets.
+      // Computed at BUY time and stored in cs.position so they don't drift.
+      const atrTpSlCfg = creds.exitStrategies?.atrTpSl;
+      const atrTpPrice = atrTpSlCfg?.enabled && atr && cs.position
+        ? cs.position.price + atr * (parseFloat(atrTpSlCfg.tpMultiplier) || 1.5)
+        : null;
+      const atrSlPrice = atrTpSlCfg?.enabled && atr && cs.position
+        ? cs.position.price - atr * (parseFloat(atrTpSlCfg.slMultiplier) || 0.75)
+        : null;
+      // Partial exit: has the 1×ATR level been hit yet?
+      const atrPartialHit = atrTpSlCfg?.enabled && atrTpSlCfg?.partialExit && atr && cs.position
+        ? newPrice >= cs.position.price + atr * 1.0
+        : false;
+
       // ── 1. Standard TP / SL ───────────────────────────────────────────────────
       const takeProfitPrice = cs.position
         ? resolveLevel(exitRule.takeProfitType, exitRule.takeProfitValue, "up") : null;
       const stopLossPrice = cs.position
         ? resolveLevel(exitRule.stopLossType, exitRule.stopLossValue, "down") : null;
 
-      const priceHitTP = takeProfitPrice && newPrice >= takeProfitPrice;
-      const hitStopLoss = stopLossPrice && newPrice <= stopLossPrice;
+      // ATR-based TP/SL overrides fixed % when enabled
+      const effectiveTpPrice = atrTpSlCfg?.enabled && atrTpPrice ? atrTpPrice : takeProfitPrice;
+      const effectiveSlPrice = atrTpSlCfg?.enabled && atrSlPrice ? atrSlPrice : stopLossPrice;
+
+      const priceHitTP  = effectiveTpPrice && newPrice >= effectiveTpPrice;
+      const hitStopLoss = effectiveSlPrice && newPrice <= effectiveSlPrice;
+
+      // Partial exit at 1×ATR — closes half the position and adjusts to breakeven SL
+      if (atrPartialHit && cs.position && !cs.position._partialExited) {
+        const halfSize  = cs.position.size / 2;
+        const halfFee   = halfSize * newPrice * (parseFloat(creds.feePercent||0) / 100);
+        const halfProfit = (newPrice - cs.position.price) * halfSize - halfFee;
+        cs.pnl += halfProfit;
+        cs.position.size -= halfSize;
+        cs.position._partialExited = true;
+        // Move SL to breakeven for the remaining half
+        cs.position._partialSl = cs.position.price * (1 + (parseFloat(creds.feePercent||0) / 100));
+        addAutoLog(
+          `📊 [PARTIAL EXIT] ${coin} 50% @ $${newPrice.toFixed(2)} +$${halfProfit.toFixed(2)} — SL moved to breakeven $${cs.position._partialSl.toFixed(2)}`,
+          "success"
+        );
+      }
+
+      // After partial exit, also enforce breakeven SL on remaining half
+      const partialSlHit = cs.position?._partialExited && cs.position?._partialSl
+        && newPrice <= cs.position._partialSl;
 
       // ── Trailing take-profit (overshoot & reverse) ───────────────────────────
       // When enabled: suppress the normal TP sell, arm a trailing exit instead.
@@ -5611,13 +6687,15 @@ function CryptoAlgoTrader() {
         hitTrailingStop || hitATRTP || hitATRStop ||
         hitTimeExit || hitSignalReversal ||
         hitCustomTTP || hitCustomTimExit || hitCustomTStop ||
-        hitCustomSigRev || hitCustomDynExit || hitCustomPBLimit || hitCustomSell
+        hitCustomSigRev || hitCustomDynExit || hitCustomPBLimit || hitCustomSell ||
+        partialSlHit  // breakeven stop after partial exit
       );
       const sellReason = hitTrailingTakeProfit        ? "TRAILING_TAKE_PROFIT"
         : hitCustomTTP                                ? "RULE_TRAILING_TAKE_PROFIT"
         : hitTakeProfit                               ? "TAKE_PROFIT"
         : hitCustomSell                               ? "RULE_STOP_LOSS"
         : hitStopLoss                                 ? "STOP_LOSS"
+        : partialSlHit                                ? "BREAKEVEN_STOP"
         : hitTrailingStop || hitCustomTStop           ? "TRAILING_STOP"
         : hitATRTP                                    ? "ATR_TAKE_PROFIT"
         : hitATRStop                                  ? "ATR_STOP_LOSS"
@@ -5654,7 +6732,7 @@ function CryptoAlgoTrader() {
       const rfDirProb      = rfPredCache[coin]?.directionProbability   ?? 0.5;
       // Use whichever predictor is more confident (RF warmup=10 ticks, LSTM=80 ticks)
       const bestDirProb    = Math.max(lstmDirProb, rfDirProb, rlProb ?? 0.5);
-      const atr            = calcATR(cs.prices, 14);
+      // atr already computed earlier in this tick (before Standard TP/SL section)
       const atrPct         = atr && newPrice ? (atr / newPrice * 100) : 999;
 
       // Individual gate sub-conditions
@@ -5678,7 +6756,7 @@ function CryptoAlgoTrader() {
 
       // Log failed gates
       // Log gate blocks only once per signal (throttle to avoid spam)
-      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending && !inCooldown) {
+      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending && !inCooldown && trendAlignOk) {
         const gateBlockKey = `${coin}-${Math.floor(Date.now()/10000)}`; // once per 10s per coin
         if (!volGateOk && !window["_gateLog_"+gateBlockKey+"_v"]) {
           window["_gateLog_"+gateBlockKey+"_v"] = true;
@@ -5688,11 +6766,87 @@ function CryptoAlgoTrader() {
         if (vgCfg?.enabled && !feeOk && !window["_gateLog_"+gateBlockKey+"_f"]) { window["_gateLog_"+gateBlockKey+"_f"]=true; addAutoLog(`[GATE] ${coin} ATR ${atrPct.toFixed(2)}% < fee ${roundTripFee.toFixed(2)}%`, "info"); }
       }
 
+      // ── Detailed BUY decision log (every tick a BUY signal fires) ─────────────
+      // Throttled to once per 10s per coin to avoid log spam
+      if (signal.action === "BUY" && !cs.position) {
+        const logKey = `buylog_${coin}_${Math.floor(Date.now()/10000)}`;
+        if (!window[logKey]) {
+          window[logKey] = true;
+          const src = creds.signalSource || "rules";
+          const lstmC = lstmPredCache[coin];
+          const rfC   = rfPredCache[coin];
+          const rlC   = rlPredCache[coin];
+
+          // Source line
+          const srcLabel = signal.fromCustomRules ? "⚙️ Custom Rules"
+            : signal.fromRL   ? "🎮 RL"
+            : signal.fromRF   ? "🌲 RF"
+            : signal.fromLSTM ? "🧠 LSTM"
+            : src === "deepseek" ? "🤖 AI Agent"
+            : "📊 Rules";
+          addAutoLog(`━━━ ${coin} BUY SIGNAL @ $${newPrice.toFixed(2)} via ${srcLabel} ━━━`, "info");
+
+          // Gate checks
+          const gates = [
+            { name: "Confidence",  ok: confPassed,  val: `${signal.confidence}% (need ${minConf}%)` },
+            { name: "Not in pos",  ok: !cs.position, val: cs.position ? "BLOCKED (already open)" : "clear" },
+            { name: "Cooldown",    ok: !inCooldown,   val: inCooldown ? `cooling ${((cooldownMs - (Date.now()-lastSell))/1000).toFixed(0)}s` : "clear" },
+            { name: "Volume",      ok: volumeOk,       val: `${volumeRatio?.toFixed(2)}× (need ${parseFloat(creds.exitStrategies?.volumeGate?.minVolumeRatio||1.2).toFixed(2)}×)` },
+            { name: "Vol gate",    ok: volGateOk,      val: `${volGateScore}/3 (vol:${volOk?"✓":"✗"} atr:${atrOk?"✓":"✗"} dir:${dirOk?"✓":"✗"})` },
+            { name: "R:R ratio",   ok: rrOk,           val: `${(tpVal/slVal).toFixed(1)}:1 (need ${minRr}:1)` },
+            { name: "Fee cover",   ok: feeOk,          val: `ATR ${atrPct.toFixed(2)}% vs fee ${roundTripFee.toFixed(2)}%` },
+            { name: "Trend align", ok: trendAlignOk,   val: taCfg?.enabled
+              ? `1h:${trendAlignDetails.bullish1h?"↑bull":"↓bear"} 15m:${trendAlignDetails.bullish15m?"↑bull":"↓bear"} RSI(1h):${trendAlignDetails.rsi_1h||"?"}`
+              : "disabled" },
+            { name: "ATR TP/SL",   ok: true,            val: atrTpSlCfg?.enabled && atr
+              ? `TP=$${atrTpPrice?.toFixed(2)||"?"} SL=$${atrSlPrice?.toFixed(2)||"?"} ATR=${atr?.toFixed(2)}`
+              : "disabled (using fixed %)" },
+          ];
+          gates.forEach(g => addAutoLog(`  ${g.ok ? "✅" : "❌"} ${g.name}: ${g.val}`, g.ok ? "info" : "warn"));
+
+          // Indicators
+          addAutoLog(`  📊 RSI=${indicators.rsi?.toFixed(1)} MACD=${indicators.macd?.toFixed(5)} Boll%B=${indicators.boll?((newPrice-indicators.boll.lower)/((indicators.boll.upper-indicators.boll.lower)||1)).toFixed(2):"n/a"} Vol=${volumeRatio?.toFixed(2)}×`, "info");
+          addAutoLog(`  📈 SMA20dist=${indicators.sma20?((newPrice-indicators.sma20)/indicators.sma20*100).toFixed(2):"n/a"}% SMA50dist=${indicators.sma50?((newPrice-indicators.sma50)/indicators.sma50*100).toFixed(2):"n/a"}% ATR=${atrPct.toFixed(3)}%`, "info");
+
+          // LSTM parameters
+          if (lstmC && lstmStatus === "ready") {
+            addAutoLog(`  🧠 LSTM: trend=${lstmC.trendScore?.toFixed(3)} Δ5=${lstmC.predictedChangePct?.toFixed(3)}% vol=${lstmC.volatility?.toFixed(3)} P↑=${lstmC.directionProbability?.toFixed(3)}`, "info");
+          } else {
+            addAutoLog(`  🧠 LSTM: ${lstmStatus === "ready" ? "ready" : `${lstmStatus || "not started"} — ${cs.prices.length < 80 ? `needs ${80 - cs.prices.length} more ticks` : "warming up"}`}`, "info");
+          }
+
+          // RF parameters
+          if (rfC) {
+            addAutoLog(`  🌲 RF: P↑=${rfC.directionProbability?.toFixed(3)} trained on ${rfC.trainedOn || "?"} samples`, "info");
+          } else {
+            addAutoLog(`  🌲 RF: warming up (need ${Math.max(0, RF_MIN_SAMPLES + 5 - cs.prices.length)} more ticks)`, "info");
+          }
+
+          // RL parameters
+          if (rlC) {
+            addAutoLog(`  🎮 RL: action=${rlC.action} Q=[H:${rlC.qValues?.[0]} B:${rlC.qValues?.[1]} S:${rlC.qValues?.[2]}] ε=${rlC.epsilon} ep=${rlC.episodes}${rlC.episodes < RL_MIN_EPISODES ? " ⚠ exploring" : ""}`, "info");
+          }
+
+          // Custom rules that fired
+          if (signal.fromCustomRules && signal.reasons?.length) {
+            signal.reasons.forEach(r => addAutoLog(`  ⚙️ Rule: ${typeof r === "object" ? r.label : r}`, "info"));
+          }
+
+          // Custom exit rules active
+          if (allCustomExits.length) {
+            allCustomExits.forEach(e => addAutoLog(`  🎯 Exit rule armed: ${e.label} (${e.action})`, "info"));
+          }
+
+          // Net decision
+          const willBuy = !cs.position && confPassed && !inWarmup && noPending && !inCooldown && volumeOk && volGateOk && rrOk && feeOk && trendAlignOk;
+          addAutoLog(`  ${willBuy ? "✅ EXECUTING BUY" : "🚫 BUY SUPPRESSED"} — signal score ${signal.score} conf ${signal.confidence}%`, willBuy ? "success" : "warn");
+        }
+      }
+
       // BUY gate: signal + mandatory checks + soft gate (2-of-3)
       if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup &&
           noPending && !inCooldown && volumeOk && volGateOk && rrOk && feeOk) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
-          // LIVE — log the signal and mark pending immediately
           addAutoLog(`🔔 BUY signal ${coin} @ $${newPrice.toFixed(2)} — conf ${signal.confidence}% score ${signal.score} — submitting order`, "info");
           pendingRef.current[coin] = "BUY";
           executeRealTrade(coin, "BUY", newPrice, parseFloat(signal.confidence))
@@ -5710,6 +6864,8 @@ function CryptoAlgoTrader() {
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
                 const buyFees = filledQty * entryPrice * (parseFloat(creds.feePercent || 0) / 100);
+                // Record RL entry state at live BUY confirmation
+                try { rlOnBuy(coin, indicators, volumeRatio); } catch(_) {}
                 logTransaction("BUY", coin, entryPrice, filledQty, null, buyFees, null,
                   agentDecisionRef.current?.[coin]?.reasoning, lstmPredCache[coin]);
                 if (dxLabel) addAutoLog(`📊 [DYNAMIC] ${coin} exits scaled: ${dxLabel}`, "info");
@@ -5773,6 +6929,8 @@ function CryptoAlgoTrader() {
           const simSize = simTradeUSD / newPrice;
           cs.position = { price: newPrice, size: simSize, entryTick: tickRef.current, sim: true, algoOwned: true };
           cs.trades++;
+          // Record RL entry state at BUY time
+          try { rlOnBuy(coin, indicators, volumeRatio); } catch(_) {}
           const simFees = simSize * newPrice * (parseFloat(creds.feePercent || 0) / 100);
           addAutoLog(`🛒 SIM BUY ${coin} — using balance $${simTradeUSD.toFixed(2)}`, "info");
           logTransaction("BUY", coin, newPrice, simSize, null, simFees, null,
@@ -5834,7 +6992,7 @@ function CryptoAlgoTrader() {
               cooldownRef.current[coin] = Date.now();
               addAutoLog(`${coin} cooling off - next BUY in ${creds.cooldownMinutes || 1} min`, "info");
               // Reward RL agent
-              try { rlReward(coin, "SELL", profit - feeCost, indicators, volumeRatio); } catch (_) {}
+              try { rlReward(coin, profit - feeCost, indicators, volumeRatio, creds.rlParams); } catch (_) {}
               // Update compounding session balance
               if (sessionBalanceRef.current !== null) {
                 const newBal = Math.max(1, sessionBalanceRef.current + profit - feeCost);
@@ -5862,7 +7020,7 @@ function CryptoAlgoTrader() {
           cs.trades++;
           cooldownRef.current[coin] = Date.now();
           // Reward RL agent with trade outcome
-          try { rlReward(coin, "SELL", profit - simFees, indicators, volumeRatio); } catch (_) {}
+          try { rlReward(coin, profit - simFees, indicators, volumeRatio, creds.rlParams); } catch (_) {}
           // Update compounding session balance
           if (sessionBalanceRef.current !== null) {
             const newBal = Math.max(1, sessionBalanceRef.current + profit);
@@ -5878,6 +7036,9 @@ function CryptoAlgoTrader() {
       const exitTrigger = canSell ? sellReason : null;
 
       const unrealized = cs.position ? (newPrice - cs.position.price) / cs.position.price * 100 : 0;
+      const lstmSnap  = lstmPredCache[coin];
+      const rfSnap    = rfPredCache[coin];
+      const rlSnap    = rlPredCache[coin];
       cs.history.push({
         t: tickRef.current, price: newPrice,
         sma20: indicators.sma20, sma50: indicators.sma50,
@@ -5888,11 +7049,42 @@ function CryptoAlgoTrader() {
         agreeingCount: signal.agreeingCount,
         totalIndicators: signal.totalIndicators,
         volumeRatio, reasons: signal.reasons,
-        // pnl stored in dollars for chart
         pnl: cs.pnl + (cs.position ? (newPrice - cs.position.price) * (cs.position.size || 0) : 0),
         exitTrigger,
         takeProfitPrice: cs.position ? takeProfitPrice : null,
         stopLossPrice: cs.position ? stopLossPrice : null,
+        // ── Rich metadata for signal analysis log ───────────────────────────
+        signalSource: creds.signalSource,
+        fromCustomRules: signal.fromCustomRules,
+        fromRL: signal.fromRL, fromRF: signal.fromRF, fromLSTM: signal.fromLSTM,
+        // LSTM snapshot
+        lstmTrend:       lstmSnap?.trendScore?.toFixed(3),
+        lstmChange:      lstmSnap?.predictedChangePct?.toFixed(3),
+        lstmVol:         lstmSnap?.volatility?.toFixed(3),
+        lstmDirProb:     lstmSnap?.directionProbability?.toFixed(3),
+        lstmStatus:      lstmStatus,
+        // RF snapshot
+        rfDirProb:       rfSnap?.directionProbability?.toFixed(3),
+        rfTrainedOn:     rfSnap?.trainedOn,
+        // RL snapshot
+        rlAction:        rlSnap?.action,
+        rlEpisodes:      rlSnap?.episodes,
+        rlEpsilon:       rlSnap?.epsilon,
+        rlQValues:       rlSnap?.qValues,
+        // Gate status
+        indicators: {
+          rsi:          indicators.rsi?.toFixed(1),
+          macd:         indicators.macd?.toFixed(4),
+          bollingerPct: indicators.boll
+            ? ((newPrice - indicators.boll.lower) / ((indicators.boll.upper - indicators.boll.lower) || 1)).toFixed(3)
+            : null,
+          sma20dist:    indicators.sma20 ? ((newPrice - indicators.sma20) / indicators.sma20 * 100).toFixed(2) : null,
+          sma50dist:    indicators.sma50 ? ((newPrice - indicators.sma50) / indicators.sma50 * 100).toFixed(2) : null,
+          atrPct:       indicators.atr   ? (indicators.atr / newPrice * 100).toFixed(3) : null,
+          volume:       volumeRatio?.toFixed(2),
+        },
+        // Custom rules that fired
+        customExitsFired: allCustomExits.map(e => e.label),
       });
       if (cs.history.length > 80) cs.history.shift();
     });
@@ -5907,31 +7099,131 @@ function CryptoAlgoTrader() {
   }, [running, speed, runTick]);
 
   // ── Derived display data ───────────────────────────────────────────────────
-  const coin = snapshot[selectedCoin];
-  const lastH = coin.history[coin.history.length - 1];
-  const currentPrice = coin.prices[coin.prices.length - 1];
-  const priceChange = coin.prices.length > 1 ? ((currentPrice - coin.prices[coin.prices.length - 2]) / coin.prices[coin.prices.length - 2]) * 100 : 0;
-  // Dollar P&L after fees — consistent with calcProfit used for closed trades
-  const unrealizedDollar = coin.position
-    ? calcProfit(coin.position.price, currentPrice, coin.position.size || 0, creds.feePercent)
-    : 0;
-  // Percentage P&L (fee-adjusted) — based on net dollar gain vs original cost
-  const unrealized = coin.position && coin.position.price && coin.position.size
-    ? (unrealizedDollar / (coin.position.price * coin.position.size)) * 100
+  // When viewing a saved session, overlay its data on the main cards
+  // so the user sees that session's trades/P&L/positions instead of live state
+  const viewSnap   = viewingSession?.snapshot;
+  // isViewing: overlay main cards with session data when:
+  // - viewing a stopped paper/live session (historical)
+  // - viewing a running VPS session (live data from poll)
+  // Does NOT overlay when the browser's own paper trading loop is running
+  const isViewing = !!viewingSession && (!running || viewingSession.isRunning);
+
+  // ── Session view data ──────────────────────────────────────────────────────
+  // When viewing a session, build proper coin-like objects for all dashboard cards.
+  // For running VPS sessions merge latest poll data. For paper sessions use snapshot.
+  const viewedSessionData = isViewing && viewSnap ? (() => {
+    // For running VPS sessions get latest polled snapshot
+    const liveS = viewingSession.isRunning
+      ? serverSessions.find(s => (s.sessionId || s.session_id) === viewingSession.sessionId)
+      : null;
+
+    const eff = {
+      pnlByCoin:    (liveS?.pnl || liveS?.pnl_by_coin || viewSnap.pnlByCoin || {}),
+      positions:    (liveS?.positions || viewSnap.positions || {}),
+      tradesByCoin: (liveS?.tradesByCoin || liveS?.trades_by_coin || viewSnap.tradesByCoin || {}),
+      coinBalances: (liveS?.coinBalances || liveS?.coin_balances || viewSnap.coinBalances || {}),
+      livePrices:   (liveS?.livePrices || {}),
+      sessionCreds: (viewSnap.creds || {}),
+      enabledCoins: (viewSnap.enabledCoins || liveS?.coins || Object.keys(viewSnap.pnlByCoin || {}) || ["BTC"]),
+      sessionBalance: parseFloat(liveS?.sessionBalance || liveS?.session_balance || viewSnap.sessionBalance || 0),
+      totalTrades:  parseInt(liveS?.totalTrades || liveS?.total_trades || viewSnap.totalTrades || 0),
+    };
+
+    // Build per-coin display objects matching the shape that dashboard cards expect
+    const coinData = {};
+    for (const c of eff.enabledCoins) {
+      const pnl      = parseFloat(eff.pnlByCoin[c] || 0);
+      const trades   = parseInt(eff.tradesByCoin[c] || 0);
+      const position = eff.positions[c] || null;
+      const cb       = eff.coinBalances[c];
+      const bal      = cb ? parseFloat(cb.current || 0) : eff.sessionBalance;
+      const livePrice = parseFloat(eff.livePrices[c]?.price || 0);
+
+      // Build a synthetic history entry for the P&L chart
+      // If we have a position, compute unrealized
+      const unrealPnl = position && livePrice && position.price
+        ? (livePrice - position.price) * position.size : 0;
+
+      // Each coin's own starting allocation — falls back to session default only if not set
+      const allocated = cb ? parseFloat(cb.allocated || 0) : parseFloat(eff.sessionCreds?.tradeSizeUSD || 50);
+
+      coinData[c] = {
+        prices:   livePrice ? [livePrice, livePrice] : [0, 0],
+        volumes:  [1],
+        history:  [{ i: 0, pnl, rsi: null, price: livePrice || null, sma20: null, sma50: null, bUpper: null, bLower: null }],
+        pnl,
+        trades,
+        position,
+        balance:  bal,
+        allocated,
+        unrealizedDollar: unrealPnl,
+        unrealized: position && livePrice ? (unrealPnl / (position.price * position.size) * 100) : 0,
+      };
+    }
+    return { coinData, eff };
+  })() : null;
+
+  // Which coin to show — snap to first coin in session if selected coin not in session
+  const viewedCoins   = viewedSessionData?.eff.enabledCoins || [];
+  const effectiveCoin = isViewing && viewedCoins.length > 0 && !viewedCoins.includes(selectedCoin)
+    ? viewedCoins[0]
+    : selectedCoin;
+
+  const viewedCoin  = viewedSessionData?.coinData[effectiveCoin] || null;
+  const coin        = viewedCoin || snapshot[effectiveCoin] || snapshot[selectedCoin];
+  const lastH       = coin.history[coin.history.length - 1];
+
+  const currentPrice = viewedCoin
+    ? (coin.prices[0] || 0)
+    : coin.prices[coin.prices.length - 1];
+  const priceChange = !viewedCoin && coin.prices.length > 1
+    ? ((currentPrice - coin.prices[coin.prices.length - 2]) / coin.prices[coin.prices.length - 2]) * 100
     : 0;
 
+  const unrealizedDollar = viewedCoin
+    ? (viewedCoin.unrealizedDollar || 0)
+    : (coin.position
+        ? calcProfit(coin.position.price, currentPrice, coin.position.size || 0, creds.feePercent)
+        : 0);
+  const unrealized = viewedCoin
+    ? (viewedCoin.unrealized || 0)
+    : (coin.position && coin.position.price && coin.position.size
+        ? (unrealizedDollar / (coin.position.price * coin.position.size)) * 100
+        : 0);
+
   const chartData = coin.history.slice(-60).map((h, i) => ({
-    i, price: +h.price.toFixed(2),
-    sma20: h.sma20 ? +h.sma20.toFixed(2) : null,
-    sma50: h.sma50 ? +h.sma50.toFixed(2) : null,
+    i, price: h.price ? +h.price.toFixed(2) : null,
+    sma20:  h.sma20  ? +h.sma20.toFixed(2)  : null,
+    sma50:  h.sma50  ? +h.sma50.toFixed(2)  : null,
     bUpper: h.bUpper ? +h.bUpper.toFixed(2) : null,
     bLower: h.bLower ? +h.bLower.toFixed(2) : null,
   }));
   const rsiData = coin.history.slice(-60).map((h, i) => ({ i, rsi: h.rsi ? +h.rsi.toFixed(1) : null }));
-  const pnlData = coin.history.slice(-60).map((h, i) => ({ i, pnl: +h.pnl.toFixed(3) }));
 
-  const activeProvider = EXCHANGE_PROVIDERS[creds.provider] || EXCHANGE_PROVIDERS.coinbase;
-  const activeKeys = creds.keys?.[creds.provider] || {};
+  // P&L chart: for viewed sessions show per-coin P&L as a single bar.
+  // For running sessions, only show P&L for the currently selected coin
+  // (coin.history already scoped to the right coin via effectiveCoin above)
+  const pnlData = isViewing && viewedSessionData
+    ? viewedCoins.map((c, i) => ({
+        i,
+        pnl: parseFloat(viewedSessionData.eff.pnlByCoin[c] || 0),
+      }))
+    : coin.history.slice(-60).map((h, i) => ({ i, pnl: +h.pnl.toFixed(3) }));
+
+  // Running session scope: only show data for coins actually in the current session
+  const runningCoins = running ? (creds.enabledCoins || COINS) : COINS;
+  const coinInSession = runningCoins.includes(effectiveCoin);
+
+  // When viewing a session use its creds for display (provider, settings labels etc)
+  const displayCreds  = isViewing && viewedSessionData?.eff.sessionCreds
+    && Object.keys(viewedSessionData.eff.sessionCreds).length > 0
+    ? viewedSessionData.eff.sessionCreds
+    : creds;
+  // Coins to display — viewed session's coins or browser creds coins
+  const DISPLAY_COINS = isViewing && viewedCoins.length > 0 ? viewedCoins : COINS;
+
+  const activeProvider = EXCHANGE_PROVIDERS[displayCreds.provider] || EXCHANGE_PROVIDERS.coinbase;
+  const activeKeys = displayCreds.keys?.[displayCreds.provider] || {};
   const hasCredentials = Object.values(activeKeys).some(v => v && v.trim());
   const statusColor = { idle: "#94a3b8", connecting: "#f59e0b", live: "#10b981", error: "#ef4444" }[autoStatus];
   const statusLabel = { idle: "Automation idle", connecting: `Connecting to ${activeProvider.name}…`, live: creds.sandbox ? "Sandbox live" : `Live on ${activeProvider.name}`, error: "Connection error" }[autoStatus];
@@ -5940,7 +7232,7 @@ function CryptoAlgoTrader() {
   const retryPriceFetch = useCallback(() => { fetchViaBridge(false, creds.provider); }, [fetchViaBridge, creds.provider]);
 
   return (
-    <div style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 13, color: "var(--color-text-primary)", padding: "12px 0" }}>
+    <div data-theme={theme} style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 13, color: "var(--color-text-primary)", padding: "12px 0", background: "var(--color-body-bg)", minHeight: "100vh" }}>
       {/* Preload TF.js — loads early so LSTM is ready when agent mode activates */}
       <script
         id="tfjs-preload"
@@ -5949,61 +7241,1372 @@ function CryptoAlgoTrader() {
       />
       {/* Inject CSS tokens for non-Claude environments (Vite, Netlify, etc.) */}
       <style>{`
-        :root {
-          --color-background-primary: #0f1117;
+        /* ── Dark theme (default) ────────────────────────────────────────────── */
+        [data-theme="dark"] {
+          --color-background-primary:   #0f1117;
           --color-background-secondary: #1a1d27;
-          --color-background-info: #1e2433;
-          --color-border-primary: #2e3347;
-          --color-border-secondary: #2e3347;
-          --color-border-tertiary: #252836;
-          --color-border-info: #3b4a6b;
-          --color-text-primary: #e8eaf0;
-          --color-text-secondary: #8b90a7;
-          --color-text-tertiary: #555b73;
-          --color-text-info: #7eb3f8;
-          --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+          --color-background-info:      #1e2433;
+          --color-border-primary:       #2e3347;
+          --color-border-secondary:     #2e3347;
+          --color-border-tertiary:      #252836;
+          --color-border-info:          #3b4a6b;
+          --color-text-primary:         #e8eaf0;
+          --color-text-secondary:       #8b90a7;
+          --color-text-tertiary:        #555b73;
+          --color-text-info:            #7eb3f8;
+          --color-body-bg:              #0f1117;
+          --color-input-bg:             #1a1d27;
+          --color-input-border:         #2e3347;
+          --color-input-text:           #e8eaf0;
+        }
+        /* ── Light theme ─────────────────────────────────────────────────────── */
+        [data-theme="light"] {
+          --color-background-primary:   #ffffff;
+          --color-background-secondary: #f4f5f7;
+          --color-background-info:      #eef2fb;
+          --color-border-primary:       #d1d5e0;
+          --color-border-secondary:     #d1d5e0;
+          --color-border-tertiary:      #e2e5ed;
+          --color-border-info:          #b8c9f0;
+          --color-text-primary:         #111827;
+          --color-text-secondary:       #4b5563;
+          --color-text-tertiary:        #9ca3af;
+          --color-text-info:            #3b76d4;
+          --color-body-bg:              #f0f2f5;
+          --color-input-bg:             #ffffff;
+          --color-input-border:         #d1d5e0;
+          --color-input-text:           #111827;
         }
         * { box-sizing: border-box; }
-        body { background: #0f1117; margin: 0; padding: 16px; }
+        body { background: var(--color-body-bg, #0f1117); margin: 0; padding: 16px; }
         input, textarea, select {
-          background: #1a1d27;
-          border: 0.5px solid #2e3347;
-          color: #e8eaf0;
+          background: var(--color-input-bg);
+          border: 0.5px solid var(--color-input-border);
+          color: var(--color-input-text);
           padding: 6px 8px;
           border-radius: 5px;
           font-size: 12px;
           outline: none;
+          transition: border-color 0.15s;
         }
         input:focus, textarea:focus, select:focus {
           border-color: #6366f1;
         }
         a { color: inherit; }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.4; }
+        }
       `}</style>
-      <h2 className="sr-only">Crypto Trader</h2>
-      {showSettings && <SettingsModal creds={creds} limits={limits} clerkPlan={clerkPlan} onSave={(f) => { setCreds(f); setShowSettings(false); addAutoLog("Credentials updated", "info"); }} onClose={() => setShowSettings(false)} />}
+      <h2 className="sr-only">Automation Trader</h2>
+      {/* ── Live session notification bar ───────────────────────────────────── */}
+      {showResumeBar && serverSessions.length > 0 && (() => {
+        const liveSessions = serverSessions.filter(s => s.running);
+        const pastSessions = serverSessions.filter(s => !s.running && (s.session_name || s.name));
+        const hasLive      = liveSessions.length > 0;
+        const hasPast      = pastSessions.length > 0;
+        if (!hasLive && !hasPast) return null;
+        return (
+          <div style={{
+            position: "fixed", top: 0, left: 0, right: 0, zIndex: 9000,
+            background: hasLive ? "#065f46" : (theme === "light" ? "#3730a3" : "#1e1b4b"),
+            padding: "0 20px",
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            height: 44, boxShadow: "0 1px 0 rgba(255,255,255,0.08)",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+                background: hasLive ? "#10b981" : "#818cf8", display: "inline-block",
+                boxShadow: hasLive ? "0 0 0 3px #10b98133" : "none" }} />
+              <span style={{ color: "#fff", fontSize: 13, fontWeight: 600 }}>
+                {hasLive
+                  ? `${liveSessions.length} trading session${liveSessions.length>1?"s":""} running on server`
+                  : `${pastSessions.length} previous session${pastSessions.length>1?"s":""} available to resume`}
+              </span>
+              {hasLive && liveSessions.slice(0,2).map(s => (
+                <span key={s.sessionId} style={{ fontSize: 11, padding: "1px 8px", borderRadius: 10,
+                  background: "rgba(255,255,255,0.12)", color: "rgba(255,255,255,0.8)" }}>
+                  {s.name} · ${parseFloat(s.sessionBalance||s.session_balance||0).toFixed(0)}
+                </span>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {!hasLive && pastSessions.length === 1 && (
+                <button onClick={async () => {
+                    await resumeServerSession(pastSessions[0].sessionId);
+                    setShowResumeBar(false);
+                  }}
+                  style={{ padding: "4px 14px", borderRadius: 6, border: "none",
+                    background: "#818cf8", color: "#fff", fontWeight: 700,
+                    fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>
+                  ▶ Resume
+                </button>
+              )}
+              <button onClick={() => { setShowResumeBar(false); setShowSessionMgr(true); }}
+                style={{ padding: "4px 12px", borderRadius: 6,
+                  border: "0.5px solid rgba(255,255,255,0.3)",
+                  background: "transparent", color: "rgba(255,255,255,0.85)",
+                  fontWeight: 600, fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>
+                {hasLive ? "View" : "View all"}
+              </button>
+              <button onClick={() => setShowResumeBar(false)}
+                style={{ background: "none", border: "none",
+                  color: "rgba(255,255,255,0.5)", fontSize: 18,
+                  cursor: "pointer", lineHeight: 1, padding: "0 2px" }}>×</button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── Session Manager Panel ─────────────────────────────────────────────── */}
+      {showSessionMgr && (
+        <>
+          {/* Backdrop */}
+          <div onClick={() => setShowSessionMgr(false)}
+            style={{ position: "fixed", inset: 0, zIndex: 7999,
+              background: theme === "light" ? "rgba(0,0,0,0.2)" : "rgba(0,0,0,0.4)", backdropFilter: "blur(2px)" }} />
+
+          <div style={{
+            position: "fixed", top: 0, right: 0, bottom: 0, width: 420, zIndex: 8000,
+            background: "var(--color-background-primary)",
+            borderLeft: "0.5px solid var(--color-border-tertiary)",
+            display: "flex", flexDirection: "column",
+            boxShadow: "-8px 0 32px rgba(0,0,0,0.4)",
+          }}>
+            {/* ── Panel header ─────────────────────────────────────────────── */}
+            <div style={{ padding: "18px 20px 14px",
+              borderBottom: "0.5px solid var(--color-border-tertiary)",
+              display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ fontSize: 15, fontWeight: 800, color: "var(--color-text-primary)" }}>
+                  Trading Sessions
+                </div>
+                <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                  {TRADING_SERVER
+                    ? `Connected to ${TRADING_SERVER.replace("https://","").replace("http://","")}`
+                    : "Live sessions not configured — paper trading only"}
+                </div>
+              </div>
+              <button onClick={() => setShowSessionMgr(false)}
+                style={{ width: 30, height: 30, borderRadius: "50%", border: "none",
+                  background: "var(--color-background-secondary)",
+                  color: "var(--color-text-secondary)", fontSize: 16,
+                  cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                ×
+              </button>
+            </div>
+
+            {/* ── Tab selector: Test sessions vs Live sessions ─────────────────── */}
+            <div style={{ display: "flex", gap: 2, padding: "10px 20px 0" }}>
+              {[
+                { id: "test", label: "🧪 Test sessions",
+                count: serverSessions.filter(s => s.mode === "simulation").length },
+              { id: "live", label: "⚡ Live sessions",
+                count: serverSessions.filter(s => s.mode === "live").length },
+              ].map(t => (
+                <button key={t.id} onClick={() => setSessionMgrTab(t.id)}
+                  style={{ flex: 1, padding: "8px 10px", borderRadius: "8px 8px 0 0",
+                    fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+                    border: "none", borderBottom: `2px solid ${sessionMgrTab === t.id ? "#6366f1" : "transparent"}`,
+                    background: sessionMgrTab === t.id ? "var(--color-background-secondary)" : "transparent",
+                    color: sessionMgrTab === t.id ? "#6366f1" : "var(--color-text-tertiary)" }}>
+                  {t.label}
+                  {t.count > 0 && (
+                    <span style={{ marginLeft: 5, fontSize: 10, padding: "1px 6px", borderRadius: 8,
+                      background: sessionMgrTab === t.id ? "#6366f122" : "var(--color-background-secondary)",
+                      color: sessionMgrTab === t.id ? "#6366f1" : "var(--color-text-tertiary)" }}>
+                      {t.count}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+
+            {/* ── Live session server not configured notice ────────────────────── */}
+            {!TRADING_SERVER && (
+              <div style={{ margin: "14px 20px", padding: "12px 14px", borderRadius: 10,
+                background: "#f59e0b0a", border: "0.5px solid #f59e0b44" }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#92400e", marginBottom: 4 }}>
+                  Live session server not connected
+                </div>
+                <div style={{ fontSize: 11, color: "#b45309", lineHeight: 1.6 }}>
+                  Add <code style={{ background: "#f59e0b22", padding: "1px 4px", borderRadius: 3 }}>VITE_TRADING_SERVER=https://trader.quantangleai.com</code> to{" "}
+                  <code style={{ background: "#f59e0b22", padding: "1px 4px", borderRadius: 3 }}>.env.local</code>,
+                  rebuild, and redeploy to enable 24/7 live trading.
+                  Until then, use Paper trade to test your strategy.
+                </div>
+              </div>
+            )}
+
+            {/* ── New session form ──────────────────────────────────────── */}
+            {TRADING_SERVER && (() => {
+              const coinAllocs = Object.keys(newCoinAllocs).length
+                ? newCoinAllocs
+                : Object.fromEntries((creds.enabledCoins||["BTC"]).map(c => [c, creds.tradeSizeUSD||"50"]));
+              return (
+                <div style={{ padding: "14px 20px",
+                  borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                  <div style={{ fontSize: 12, fontWeight: 700,
+                    color: "var(--color-text-primary)", marginBottom: 10 }}>
+                    New session
+                  </div>
+
+                  {/* Name input */}
+                  <input value={newSessionName}
+                    onChange={e => { setNewSessionName(e.target.value); setNewSessionError(""); }}
+                    placeholder="Give this session a name (e.g. BTC momentum test)"
+                    style={{ width: "100%", boxSizing: "border-box", fontSize: 12,
+                      padding: "8px 10px", borderRadius: 8,
+                      border: "0.5px solid var(--color-border-secondary)",
+                      background: "var(--color-background-secondary)",
+                      color: "var(--color-text-primary)", marginBottom: 10 }} />
+
+                  {/* Mode cards */}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+                    {[
+                      { id: "simulation", icon: "🧪", label: "Paper trade",
+                        desc: "Test your strategy with no real money" },
+                      { id: "live",       icon: "⚡", label: "Live trade",
+                        desc: "Execute real orders on the exchange",
+                        locked: !limits.canLive || !hasCredentials,
+                        lockMsg: !limits.canLive ? "Requires Pro plan" : "Add API keys in Settings" },
+                    ].map(m => (
+                      <button key={m.id}
+                        onClick={() => !m.locked && setNewSessionMode(m.id)}
+                        disabled={m.locked}
+                        style={{ padding: "10px 12px", borderRadius: 8, textAlign: "left",
+                          border: `1.5px solid ${newSessionMode===m.id
+                            ? (m.id==="live"?"#10b981":"#6366f1")
+                            : "var(--color-border-tertiary)"}`,
+                          background: newSessionMode===m.id
+                            ? (m.id==="live"?"#10b98109":"#6366f109")
+                            : "var(--color-background-secondary)",
+                          cursor: m.locked ? "not-allowed" : "pointer",
+                          opacity: m.locked ? 0.5 : 1,
+                          fontFamily: "inherit", width: "100%" }}>
+                        <div style={{ fontSize: 18, marginBottom: 3 }}>{m.icon}</div>
+                        <div style={{ fontSize: 11, fontWeight: 700,
+                          color: newSessionMode===m.id
+                            ? (m.id==="live"?"#10b981":"#6366f1")
+                            : "var(--color-text-primary)" }}>
+                          {m.label}
+                        </div>
+                        <div style={{ fontSize: 10,
+                          color: m.locked ? "#ef4444" : "var(--color-text-tertiary)",
+                          marginTop: 2, lineHeight: 1.3 }}>
+                          {m.locked ? m.lockMsg : m.desc}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Per-coin balance */}
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600,
+                      color: "var(--color-text-secondary)", marginBottom: 6 }}>
+                      Starting balance per coin
+                      <span style={{ fontWeight: 400, color: "var(--color-text-tertiary)", marginLeft: 6 }}>
+                        — each coin compounds independently
+                      </span>
+                    </div>
+                    {(creds.enabledCoins || ["BTC"]).map(coin => (
+                      <div key={coin} style={{ display: "flex", alignItems: "center",
+                        gap: 8, marginBottom: 6 }}>
+                        <div style={{ width: 36, height: 36, borderRadius: 8,
+                          background: "var(--color-background-secondary)",
+                          display: "flex", alignItems: "center", justifyContent: "center",
+                          fontSize: 10, fontWeight: 800, color: COIN_COLORS[coin] || "#6366f1",
+                          flexShrink: 0 }}>{coin}</div>
+                        <div style={{ flex: 1, position: "relative" }}>
+                          <span style={{ position: "absolute", left: 9, top: "50%",
+                            transform: "translateY(-50%)", fontSize: 12,
+                            color: "var(--color-text-tertiary)" }}>$</span>
+                          <input type="number" min="1"
+                            value={coinAllocs[coin] || creds.tradeSizeUSD || "50"}
+                            onChange={e => setNewCoinAllocs(p => ({...p, [coin]: e.target.value}))}
+                            style={{ width: "100%", boxSizing: "border-box",
+                              fontSize: 13, fontWeight: 600,
+                              padding: "7px 8px 7px 20px", borderRadius: 7,
+                              border: "0.5px solid var(--color-border-secondary)",
+                              background: "var(--color-background-primary)",
+                              color: "var(--color-text-primary)" }} />
+                        </div>
+                        <span style={{ fontSize: 10, color: "var(--color-text-tertiary)",
+                          minWidth: 28 }}>USD</span>
+                      </div>
+                    ))}
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)",
+                      textAlign: "right" }}>
+                      Total committed:{" "}
+                      <strong style={{ color: "var(--color-text-secondary)" }}>
+                        ${(creds.enabledCoins||["BTC"]).reduce(
+                          (s,c) => s + parseFloat(coinAllocs[c]||creds.tradeSizeUSD||50), 0
+                        ).toFixed(2)}
+                      </strong>
+                    </div>
+                  </div>
+
+                  {newSessionError && (
+                    <div style={{ fontSize: 11, color: "#ef4444", marginBottom: 8,
+                      padding: "6px 10px", borderRadius: 6,
+                      background: "#ef444411", border: "0.5px solid #ef444433" }}>
+                      {newSessionError}
+                    </div>
+                  )}
+
+                  <button
+                    disabled={newSessionStarting}
+                    onClick={async () => {
+                      if (!newSessionName.trim()) { setNewSessionError("Please name this session"); return; }
+                      setNewSessionStarting(true); setNewSessionError("");
+                      try {
+                        if (newSessionMode === "simulation") {
+                          // Test session: now runs on the VPS server 24/7 (not in browser)
+                          // Same code path as live but with mode="simulation" — no real orders
+                          if (!TRADING_SERVER) {
+                            setNewSessionError("Trading server not configured. Set VITE_TRADING_SERVER in .env.local. Without it, test sessions stop when the tab closes.");
+                            // Don't return — fall through to show the error but still allow start
+                          }
+                          const res = await serverFetch("/sessions", {
+                            method: "POST",
+                            body: JSON.stringify({
+                              creds, name: newSessionName.trim(),
+                              mode: "simulation", coinAllocations: coinAllocs,
+                            }),
+                          });
+                          const data = await res.json();
+                          if (!res.ok) { setNewSessionError(data.error || "Failed to start"); return; }
+                          setActiveSessionId(data.sessionId);
+                          setNewSessionName("");
+                          addAutoLog(`🧪 Test session "${data.name}" started on server — runs 24/7`, "success");
+                          fetchServerSessions();
+                          setShowSessionMgr(false);
+                        } else {
+                          // Live trade: runs on the live trading server
+                          if (!TRADING_SERVER) {
+                            setNewSessionError("Live session server not configured. Set VITE_TRADING_SERVER in .env.local.");
+                            return;
+                          }
+                          const res = await serverFetch("/sessions", {
+                            method: "POST",
+                            body: JSON.stringify({
+                              creds, name: newSessionName.trim(),
+                              mode: "live", coinAllocations: coinAllocs,
+                            }),
+                          });
+                          const data = await res.json();
+                          if (!res.ok) { setNewSessionError(data.error || "Failed to start"); return; }
+                          setActiveSessionId(data.sessionId);
+                          setNewSessionName("");
+                          addAutoLog(`▶ Live session "${data.name}" started`, "success");
+                          fetchServerSessions();
+                        }
+                      } catch (e) {
+                        setNewSessionError(e.message);
+                      } finally { setNewSessionStarting(false); }
+                    }}
+                    style={{ width: "100%", padding: "10px 0", borderRadius: 8,
+                      border: "none",
+                      background: newSessionStarting ? "#6366f166" : "#6366f1",
+                      color: "#fff", fontWeight: 700, fontSize: 13,
+                      cursor: newSessionStarting ? "wait" : "pointer",
+                      fontFamily: "inherit" }}>
+                    {newSessionStarting ? "Starting…" : newSessionMode === "live" ? "▶ Start live session" : "▶ Start paper trade"}
+                  </button>
+                </div>
+              );
+            })()}
+
+            {/* ── Session list ──────────────────────────────────────────── */}
+            <div style={{ flex: 1, overflowY: "auto", padding: "10px 20px" }}>
+
+              {/* ── Paper sessions (logged-in users only) ─────────────────── */}
+              {sessionMgrTab === "test" && !TRADING_SERVER && (
+                <div style={{ margin: "0 0 14px",
+                  padding: "12px 14px", borderRadius: 10,
+                  background: "#f59e0b0a", border: "0.5px solid #f59e0b44" }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#92400e", marginBottom: 3 }}>
+                    Trading server not configured
+                  </div>
+                  <div style={{ fontSize: 11, color: "#b45309", lineHeight: 1.6 }}>
+                    Test sessions run on the server 24/7. Set{" "}
+                    <code style={{ background: "#f59e0b22", padding: "1px 4px", borderRadius: 3 }}>
+                      VITE_TRADING_SERVER
+                    </code>{" "}to enable persistent test sessions.
+                  </div>
+                </div>
+              )}
+              {sessionMgrTab === "test" && serverSessions.filter(s => s.mode === "simulation").length === 0 && (
+                <div style={{ textAlign: "center", padding: "20px 0",
+                  color: "var(--color-text-tertiary)", fontSize: 12 }}>
+                  No test sessions yet.<br/>Start one above to begin simulation.
+                </div>
+              )}
+              {sessionMgrTab === "test" && serverSessions.filter(s => s.mode === "simulation").map(s => {
+                const sid    = s.sessionId || s.session_id;
+                const name   = s.name || s.session_name || "Test Session";
+                const isActiveSim = sid === activeSessionId;
+                // These are pre-normalised in fetchServerSessions
+                const coinBals = s.coinBalances || {};
+                const bal    = Object.values(coinBals).reduce((a, b) => a + (parseFloat(b.current) || 0), 0);
+                const trades = s.totalTrades || 0;
+                const totalPnl = Object.values(s.pnl || {}).reduce((a, b) => a + (parseFloat(b)||0), 0);
+                const totalUnrealized = Object.values(s.unrealized || {}).reduce((a,b) => a+(parseFloat(b)||0), 0);
+                return (
+                  <div key={sid}
+                    style={{ marginBottom: 10, borderRadius: 10, overflow: "hidden",
+                      border: `1.5px solid ${isActiveSim ? "#6366f1" : "var(--color-border-tertiary)"}`,
+                      background: isActiveSim ? "#6366f106" : "var(--color-background-secondary)" }}>
+                    <div style={{ padding: "10px 14px",
+                      display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+                          background: s.running ? "#10b981" : "#94a3b8",
+                          boxShadow: s.running ? "0 0 0 3px #10b98122" : "none" }} />
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: "var(--color-text-primary)",
+                            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            🧪 {name}
+                          </div>
+                          <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 1 }}>
+                            {(s.coins || []).join(", ")}
+                            {" · "}{s.running ? "● running on server" : `stopped ${fmtDateTime(new Date(s.updated_at || s.created_at))}`}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                        <button onClick={e => {
+                            e.stopPropagation();
+                            setViewingSession({
+                              name, sessionId: sid, isLive: true,
+                              isRunning: s.running, savedAt: s.updated_at,
+                              snapshot: {
+                                sessionBalance: bal, pnlByCoin: s.pnl || s.pnl_by_coin || {},
+                                enabledCoins: s.coins || [], creds: s.credsSnapshot || s.creds_snapshot || {},
+                                totalTrades: trades, coinBalances: s.coinBalances || {},
+                                logs: s.logs || [], positions: s.positions || {},
+                                tradesByCoin: s.tradesByCoin || s.trades_by_coin || {},
+                                unrealized: s.unrealized || s.unrealized_by_coin || {},
+                              },
+                            });
+                            setShowViewerDrawer(true);
+                            setShowSessionMgr(false);
+                          }}
+                          style={{ padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+                            background: "var(--color-background-primary)",
+                            color: "var(--color-text-secondary)",
+                            border: "0.5px solid var(--color-border-secondary)",
+                            cursor: "pointer", fontFamily: "inherit" }}>
+                          👁
+                        </button>
+                        {!s.running && (
+                          <button onClick={e => { e.stopPropagation(); resumeServerSession(sid); }}
+                            style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                              background: "#6366f1", color: "#fff", border: "none",
+                              cursor: "pointer", fontFamily: "inherit" }}>
+                            ▶ Resume
+                          </button>
+                        )}
+                        {s.running && (
+                          <button onClick={e => { e.stopPropagation(); stopServerSession(sid); }}
+                            style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                              background: "#ef444422", color: "#ef4444",
+                              border: "0.5px solid #ef444444", cursor: "pointer", fontFamily: "inherit" }}>
+                            ⏹ Stop
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <div style={{ padding: "0 14px 10px",
+                      display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
+                      {[
+                        { label: "Balance", val: `$${bal.toFixed(2)}`, color: "var(--color-text-primary)" },
+                        { label: "Realized P&L", val: `${totalPnl>=0?"+":""}$${totalPnl.toFixed(2)}`,
+                          color: totalPnl >= 0 ? "#10b981" : "#ef4444" },
+                        { label: "Unrealized", val: `${totalUnrealized>=0?"+":""}$${totalUnrealized.toFixed(2)}`,
+                          color: totalUnrealized >= 0 ? "#10b981" : "#f59e0b" },
+                        { label: "Trades", val: trades, color: "var(--color-text-primary)" },
+                      ].map(stat => (
+                        <div key={stat.label} style={{ background: "var(--color-background-primary)",
+                          borderRadius: 6, padding: "6px 8px", textAlign: "center" }}>
+                          <div style={{ fontSize: 9, color: "var(--color-text-tertiary)",
+                            marginBottom: 2, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                            {stat.label}
+                          </div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: stat.color }}>
+                            {stat.val}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+              {/* Legacy: old browser-based paper session snapshots (shown for migration) */}
+              {sessionMgrTab === "test" && clerkUser && paperSessions.length > 0 && (
+                <div style={{ marginBottom: 18 }}>
+                  <div style={{ display: "flex", alignItems: "center",
+                    justifyContent: "space-between", marginBottom: 10 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700,
+                      color: "var(--color-text-secondary)",
+                      textTransform: "uppercase", letterSpacing: 0.5 }}>
+                      🧪 Saved paper sessions
+                    </div>
+                    {/* Save current paper session inline — uses component-level paperInlineName */}
+                    {running && !autoEnabled && (
+                      <div style={{ display: "flex", gap: 5 }}>
+                        <input value={paperInlineName}
+                          onChange={e => setPaperInlineName(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === "Enter" && paperInlineName.trim()) {
+                              savePaperSession(paperInlineName.trim());
+                              setPaperInlineName("");
+                            }
+                          }}
+                          placeholder="Name & save current…"
+                          style={{ fontSize: 10, padding: "4px 8px", borderRadius: 5,
+                            border: "0.5px solid var(--color-border-secondary)",
+                            background: "var(--color-background-secondary)",
+                            color: "var(--color-text-primary)", width: 130 }} />
+                        <button
+                          disabled={!paperInlineName.trim() || paperSaving}
+                          onClick={() => {
+                            if (paperInlineName.trim()) {
+                              savePaperSession(paperInlineName.trim());
+                              setPaperInlineName("");
+                            }
+                          }}
+                          style={{ padding: "4px 10px", borderRadius: 5, fontSize: 10,
+                            fontWeight: 700, background: "#6366f1", color: "#fff",
+                            border: "none", cursor: "pointer", fontFamily: "inherit",
+                            opacity: paperInlineName.trim() ? 1 : 0.4 }}>
+                          {paperSaving ? "…" : "Save"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {paperSessions.length === 0 ? (
+                    <div style={{ fontSize: 11, color: "var(--color-text-tertiary)",
+                      padding: "12px 14px", borderRadius: 8, textAlign: "center",
+                      background: "var(--color-background-secondary)" }}>
+                      No saved paper sessions yet.
+                      {running && !autoEnabled
+                        ? " Name and save your current session above."
+                        : " Start a paper trade and click ☁️ Save session to preserve your progress."}
+                    </div>
+                  ) : paperSessions.map(ps => {
+                    const sid      = ps.session_id;
+                    const snap     = ps.snapshot || {};
+                    const bal      = parseFloat(snap.sessionBalance || 0);
+                    const totalPnl = Object.values(snap.pnlByCoin || {})
+                      .reduce((a,b) => a + (parseFloat(b)||0), 0);
+                    const trades   = snap.totalTrades || 0;
+                    const coins    = snap.enabledCoins || [];
+                    // isActive: this session is the one CURRENTLY running in this browser tab
+                    // right now. Paper sessions cannot run in the background — only one can
+                    // be active per tab, and only while `running` is true.
+                    const isActive = sid === activePaperSessionId && running;
+                    // stopped === true only when the user explicitly clicked Stop.
+                    // stopped === false (or missing, for older sessions) means the
+                    // last known state was WHILE running — treat as still active,
+                    // since paper sessions are conceptually "on" until stopped.
+                    const wasStopped = snap.stopped === true;
+                    // Same card structure/style as Live session cards for consistency
+                    return (
+                      <div key={sid}
+                        style={{ marginBottom: 10, borderRadius: 10, overflow: "hidden",
+                          border: `1.5px solid ${isActive ? "#6366f1" : "var(--color-border-tertiary)"}`,
+                          background: isActive ? "#6366f106" : "var(--color-background-secondary)",
+                          transition: "border-color 0.15s" }}>
+
+                        {/* Card header */}
+                        <div style={{ padding: "10px 14px",
+                          display: "flex", alignItems: "center",
+                          justifyContent: "space-between", gap: 8 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                            <div style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+                              background: isActive ? "#10b981" : wasStopped ? "#94a3b8" : "#f59e0b",
+                              boxShadow: isActive ? "0 0 0 3px #10b98122" : "none" }} />
+                            <div style={{ minWidth: 0 }}>
+                              <div style={{ fontSize: 13, fontWeight: 700,
+                                color: "var(--color-text-primary)",
+                                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {ps.name}
+                              </div>
+                              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 1 }}>
+                                🧪 Paper · {snap.signalSource || "rules"}
+                                {" · "}{coins.join(", ")}
+                                {isActive
+                                  ? <span style={{ color: "#10b981" }}> · ● running now in this tab</span>
+                                  : wasStopped
+                                    ? <> · stopped {fmtDateTime(new Date(ps.updated_at))}</>
+                                    : <span style={{ color: "#f59e0b" }}> · interrupted — last synced {fmtDateTime(new Date(ps.updated_at))}</span>}
+                              </div>
+                            </div>
+                          </div>
+                          <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                            <button data-tour="session-eye-icon" onClick={e => {
+                                e.stopPropagation();
+                                setViewingSession({ name: ps.name, snapshot: ps.snapshot, savedAt: ps.updated_at, sessionId: sid });
+                                setShowViewerDrawer(true);
+                                setShowSessionMgr(false);
+                              }}
+                              title="View this session's stats and settings"
+                              style={{ padding: "4px 8px", borderRadius: 6, fontSize: 11,
+                                fontWeight: 600, background: "var(--color-background-primary)",
+                                color: "var(--color-text-secondary)",
+                                border: "0.5px solid var(--color-border-secondary)",
+                                cursor: "pointer", fontFamily: "inherit" }}>
+                              👁
+                            </button>
+                            <button
+                              onClick={e => { e.stopPropagation(); if (!isActive) resumePaperSession(ps); }}
+                              disabled={isActive}
+                              title={isActive
+                                ? "Already running in this tab — nothing to resume"
+                                : wasStopped
+                                  ? "Resume from where you stopped"
+                                  : "Resume — session is still running on the server"}
+                              style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11,
+                                fontWeight: 700,
+                                background: isActive ? "var(--color-background-primary)" : "#6366f1",
+                                color: isActive ? "var(--color-text-tertiary)" : "#fff",
+                                border: isActive ? "0.5px solid var(--color-border-secondary)" : "none",
+                                cursor: isActive ? "not-allowed" : "pointer",
+                                opacity: isActive ? 0.6 : 1,
+                                fontFamily: "inherit" }}>
+                              {isActive ? "● Running" : "▶ Resume"}
+                            </button>
+                            <button onClick={e => {
+                                e.stopPropagation();
+                                if (window.confirm(`Delete "${ps.name}"?`)) deletePaperSession(sid);
+                              }}
+                              style={{ padding: "4px 10px", borderRadius: 6, fontSize: 11,
+                                fontWeight: 700, background: "#ef444422",
+                                color: "#ef4444", border: "0.5px solid #ef444444",
+                                cursor: "pointer", fontFamily: "inherit" }}>
+                              ×
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Stats row */}
+                        <div style={{ padding: "0 14px 10px",
+                          display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                          {[
+                            { label: "Balance",  val: `$${bal.toFixed(2)}`,  color: "var(--color-text-primary)" },
+                            { label: "P&L",      val: `${totalPnl>=0?"+":""}$${totalPnl.toFixed(2)}`,
+                              color: totalPnl >= 0 ? "#10b981" : "#ef4444" },
+                            { label: "Trades",   val: trades,               color: "var(--color-text-primary)" },
+                          ].map(stat => (
+                            <div key={stat.label} style={{ background: "var(--color-background-primary)",
+                              borderRadius: 6, padding: "6px 8px", textAlign: "center" }}>
+                              <div style={{ fontSize: 9, color: "var(--color-text-tertiary)",
+                                marginBottom: 2, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                                {stat.label}
+                              </div>
+                              <div style={{ fontSize: 13, fontWeight: 700, color: stat.color }}>
+                                {stat.val}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* Per-coin balance pills */}
+                        {coins.length > 0 && (
+                          <div style={{ padding: "0 14px 10px",
+                            display: "flex", gap: 6, flexWrap: "wrap" }}>
+                            {coins.map(coin => {
+                              const cb  = (snap.coinBalances || {})[coin];
+                              const pnl = parseFloat((snap.pnlByCoin || {})[coin] || 0);
+                              return (
+                                <div key={coin} style={{ display: "flex", alignItems: "center",
+                                  gap: 5, padding: "3px 8px", borderRadius: 5,
+                                  background: "var(--color-background-primary)",
+                                  border: "0.5px solid var(--color-border-tertiary)", fontSize: 10 }}>
+                                  <span style={{ fontWeight: 700,
+                                    color: COIN_COLORS[coin] || "#6366f1" }}>{coin}</span>
+                                  <span style={{ color: "var(--color-text-secondary)" }}>
+                                    ${cb ? parseFloat(cb.current||0).toFixed(2) : bal.toFixed(2)}
+                                  </span>
+                                  <span style={{ color: pnl>=0?"#10b981":"#ef4444" }}>
+                                    {pnl>=0?"+":""}{pnl.toFixed(2)}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                </div>
+              )}
+
+              {/* ── Live sessions heading + list ──────────────────────────── */}
+              {sessionMgrTab === "live" && !TRADING_SERVER && (
+                <div style={{ textAlign: "center", padding: "40px 20px",
+                  color: "var(--color-text-tertiary)", fontSize: 12, lineHeight: 1.6 }}>
+                  Live session server not configured.<br/>Set VITE_TRADING_SERVER to enable live trading.
+                </div>
+              )}
+              {sessionMgrTab === "live" && TRADING_SERVER && (
+                <div style={{ marginBottom: 10 }}>
+                  {serverSessions.length === 0 && (
+                    <div style={{ textAlign: "center", padding: "20px 0",
+                      color: "var(--color-text-tertiary)", fontSize: 12 }}>
+                      No live sessions yet.<br/>Start one above to begin live trading.
+                    </div>
+                  )}
+                </div>
+              )}
+              {sessionMgrTab === "live" && serverSessions.filter(s => s.mode === "live").map(s => {
+                const sid      = s.sessionId || s.session_id;
+                const name     = s.name || s.session_name || "Session";
+                const isActive = sid === activeSessionId;
+                const totalPnl = Object.values(s.pnl || s.pnl_by_coin || {})
+                  .reduce((a,b) => a + (parseFloat(b)||0), 0);
+                const bal      = parseFloat(s.sessionBalance || s.session_balance || 0);
+                const trades   = s.total_trades || s.totalTrades || 0;
+                return (
+                  <div key={sid}
+                    onClick={() => setActiveSessionId(isActive ? null : sid)}
+                    style={{ marginBottom: 10, borderRadius: 10, overflow: "hidden",
+                      border: `1.5px solid ${isActive
+                        ? (s.running ? "#10b981" : "#6366f1")
+                        : "var(--color-border-tertiary)"}`,
+                      background: isActive
+                        ? (s.running ? "#10b98106" : "#6366f106")
+                        : "var(--color-background-secondary)",
+                      cursor: "pointer", transition: "border-color 0.15s" }}>
+
+                    {/* Card header */}
+                    <div style={{ padding: "10px 14px",
+                      display: "flex", alignItems: "center",
+                      justifyContent: "space-between", gap: 8 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+                          background: s.running ? "#10b981" : "#94a3b8",
+                          boxShadow: s.running ? "0 0 0 3px #10b98122" : "none" }} />
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700,
+                            color: "var(--color-text-primary)",
+                            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {name}
+                          </div>
+                          <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 1 }}>
+                            {s.mode === "live" ? "⚡ Live" : "🧪 Paper"} · {s.exchange || "binance"}
+                            {" · "}{(s.coins||[]).join(", ")}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                        {!s.running && (
+                          <>
+                            <button onClick={e => {
+                                e.stopPropagation();
+                                setViewingSession({
+                                  name: name,
+                                  savedAt: s.updated_at,
+                                  sessionId: sid,
+                                  snapshot: {
+                                    sessionBalance: bal,
+                                    pnlByCoin:      s.pnl || s.pnl_by_coin || {},
+                                    enabledCoins:   s.coins || [],
+                                    creds:          s.creds_snapshot || {},
+                                    signalSource:   s.creds_snapshot?.signalSource || "rules",
+                                    totalTrades:    trades,
+                                    coinBalances:   s.coinBalances || s.coin_balances || {},
+                                    logs:           s.logs || [],
+                                    positions:      s.positions || {},
+                                    tradesByCoin:   s.trades_by_coin || s.tradesByCoin || {},
+                                  },
+                                  isLive: true,
+                                });
+                                setShowViewerDrawer(true);
+                                setShowSessionMgr(false);
+                              }}
+                              style={{ padding: "4px 8px", borderRadius: 6, fontSize: 11,
+                                fontWeight: 600, background: "var(--color-background-primary)",
+                                color: "var(--color-text-secondary)",
+                                border: "0.5px solid var(--color-border-secondary)",
+                                cursor: "pointer", fontFamily: "inherit" }}>
+                              👁
+                            </button>
+                            <button onClick={e => { e.stopPropagation(); resumeServerSession(sid); }}
+                              style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11,
+                                fontWeight: 700, background: "#6366f1",
+                                color: "#fff", border: "none", cursor: "pointer",
+                                fontFamily: "inherit" }}>
+                              ▶ Resume
+                            </button>
+                          </>
+                        )}
+                        {s.running && (
+                          <>
+                            <button onClick={e => {
+                                e.stopPropagation();
+                                // Switch main dashboard to show this session's live data
+                                setActiveSessionId(sid);
+                                setViewingSession({
+                                  name:      name,
+                                  sessionId: sid,
+                                  isLive:    true,
+                                  isRunning: true,
+                                  savedAt:   s.updated_at,
+                                  snapshot: {
+                                    sessionBalance: bal,
+                                    pnlByCoin:      s.pnl || s.pnl_by_coin || {},
+                                    enabledCoins:   s.coins || [],
+                                    creds:          s.creds_snapshot || {},
+                                    signalSource:   s.creds_snapshot?.signalSource || "rules",
+                                    totalTrades:    trades,
+                                    coinBalances:   s.coinBalances || s.coin_balances || {},
+                                    logs:           s.logs || [],
+                                    positions:      s.positions || {},
+                                    tradesByCoin:   s.trades_by_coin || s.tradesByCoin || {},
+                                  },
+                                });
+                                setShowViewerDrawer(true);
+                                setShowSessionMgr(false);
+                              }}
+                              style={{ padding: "4px 8px", borderRadius: 6, fontSize: 11,
+                                fontWeight: 600, background: "var(--color-background-primary)",
+                                color: "var(--color-text-secondary)",
+                                border: "0.5px solid var(--color-border-secondary)",
+                                cursor: "pointer", fontFamily: "inherit" }}>
+                              👁 View
+                            </button>
+                            <button onClick={e => { e.stopPropagation(); stopServerSession(sid); }}
+                              style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11,
+                                fontWeight: 700, background: "#ef444422",
+                                color: "#ef4444", border: "0.5px solid #ef444444",
+                                cursor: "pointer", fontFamily: "inherit" }}>
+                              ⏹ Stop
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Stats row */}
+                    <div style={{ padding: "0 14px 10px",
+                      display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                      {[
+                        { label: "Balance",  val: `$${bal.toFixed(2)}`,  color: "var(--color-text-primary)" },
+                        { label: "P&L",      val: `${totalPnl>=0?"+":""}$${totalPnl.toFixed(2)}`,
+                          color: totalPnl >= 0 ? "#10b981" : "#ef4444" },
+                        { label: "Trades",   val: trades,               color: "var(--color-text-primary)" },
+                      ].map(stat => (
+                        <div key={stat.label} style={{ background: "var(--color-background-primary)",
+                          borderRadius: 6, padding: "6px 8px", textAlign: "center" }}>
+                          <div style={{ fontSize: 9, color: "var(--color-text-tertiary)",
+                            marginBottom: 2, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                            {stat.label}
+                          </div>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: stat.color }}>
+                            {stat.val}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Per-coin balance pills */}
+                    {(s.coins||[]).length > 0 && (
+                      <div style={{ padding: "0 14px 10px",
+                        display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        {(s.coins||[]).map(coin => {
+                          const cb  = (s.coinBalances || s.coin_balances || {})[coin];
+                          const pnl = parseFloat((s.pnl||s.pnl_by_coin||{})[coin]||0);
+                          return (
+                            <div key={coin} style={{ display: "flex", alignItems: "center",
+                              gap: 5, padding: "3px 8px", borderRadius: 5,
+                              background: "var(--color-background-primary)",
+                              border: "0.5px solid var(--color-border-tertiary)", fontSize: 10 }}>
+                              <span style={{ fontWeight: 700,
+                                color: COIN_COLORS[coin] || "#6366f1" }}>{coin}</span>
+                              <span style={{ color: "var(--color-text-secondary)" }}>
+                                ${cb ? parseFloat(cb.current||0).toFixed(2) : "—"}
+                              </span>
+                              <span style={{ color: pnl>=0?"#10b981":"#ef4444" }}>
+                                {pnl>=0?"+":""}{pnl.toFixed(2)}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* ── Marketplace overlay ─────────────────────────────────────────────────── */}
+      {showMarketplace && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 8800,
+          background: "var(--color-background-primary)",
+          display: "flex", flexDirection: "column",
+        }}>
+          <MarketplacePanel
+            PROXY_BASE={PROXY_BASE}
+            creds={creds}
+            theme={theme}
+            clerkUser={clerkUser}
+            onClose={() => setShowMarketplace(false)}
+            onCopy={({ settings, coins, signalSource }) => {
+              // Merge copied strategy settings into current creds
+              // (keep user's own API keys, trade size, provider)
+              const merged = {
+                ...creds,          // keep keys, tradeSizeUSD, provider
+                ...settings,       // overlay signal config, exits, indicators, rules
+                enabledCoins: coins || creds.enabledCoins,
+                signalSource:  signalSource || settings.signalSource || creds.signalSource,
+              };
+              setCreds(merged);
+              setShowMarketplace(false);
+              setShowSettings(true); // open settings so user can review before running
+              addAutoLog("📋 Strategy copied — review settings before starting", "info");
+            }}
+          />
+        </div>
+      )}
+
+      {/* ── Onboarding tour overlay ───────────────────────────────────────────── */}
+      {tourActive && (
+        <OnboardingTour
+          steps={visibleTourSteps}
+          stepIndex={Math.min(tourStep, visibleTourSteps.length - 1)}
+          onNext={() => setTourStep(s => Math.min(s + 1, visibleTourSteps.length - 1))}
+          onBack={() => setTourStep(s => Math.max(s - 1, 0))}
+          onSkip={endTour}
+          onFinish={endTour}
+        />
+      )}
+
+      {/* ── Session context bar — shown when viewing a saved session ─────────── */}
+      {viewingSession && (!running || viewingSession.isRunning) && (
+        <div style={{
+          position: "fixed", top: 0, left: 0, right: 0, zIndex: 9001,
+          background: theme === "light" ? "#3730a3" : "#1e1b4b", padding: "0 20px", height: 44,
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          boxShadow: "0 1px 0 rgba(255,255,255,0.08)",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {viewingSession.isRunning ? (
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ width: 7, height: 7, borderRadius: "50%",
+                  background: "#10b981", boxShadow: "0 0 0 3px #10b98133",
+                  display: "inline-block", flexShrink: 0 }} />
+                <span style={{ fontSize: 12, color: "#10b981", fontWeight: 600 }}>Live</span>
+              </div>
+            ) : (
+              <span style={{ fontSize: 12, color: "rgba(255,255,255,0.5)" }}>Viewing</span>
+            )}
+            <span style={{ fontSize: 13, fontWeight: 700, color: "#fff" }}>
+              {viewingSession.isLive ? "⚡" : "🧪"} {viewingSession.name}
+            </span>
+            {viewingSession.isRunning && (
+              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+                updates every 3s
+              </span>
+            )}
+            {!viewingSession.isRunning && viewingSession.savedAt && (
+              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+                saved {fmtDateTime(new Date(viewingSession.savedAt))}
+              </span>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            {!viewingSession.isLive && !viewingSession.isRunning && (
+              <>
+                <button onClick={() => {
+                    const ps = paperSessions.find(p => p.session_id === viewingSession.sessionId);
+                    if (ps) { resumePaperSession(ps); }
+                    // resumePaperSession clears viewingSession internally
+                  }}
+                  style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                    background: "#6366f1", color: "#fff", border: "none",
+                    cursor: "pointer", fontFamily: "inherit" }}>
+                  ▶ Resume
+                </button>
+                <button onClick={() => {
+                    const ps = paperSessions.find(p => p.session_id === viewingSession.sessionId);
+                    if (ps?.snapshot?.creds) {
+                      setCreds(ps.snapshot.creds);
+                      const bal = parseFloat(ps.snapshot.creds.tradeSizeUSD) || 50;
+                      sessionBalanceRef.current = bal;
+                      sessionStartBalanceRef.current = bal;
+                      setSessionBalance(bal);
+                      // Reset charts
+                      for (const c of (ps.snapshot.enabledCoins || ["BTC"])) {
+                        if (stateRef.current[c]) {
+                          const lastPrice = stateRef.current[c].prices.at(-1) || COIN_BASE[c] || 1;
+                          stateRef.current[c].prices  = [lastPrice];
+                          stateRef.current[c].volumes = [1];
+                          stateRef.current[c].history = [];
+                          stateRef.current[c].pnl     = 0;
+                          stateRef.current[c].trades  = 0;
+                          stateRef.current[c].position = null;
+                        }
+                      }
+                      setWsEnabled(true); setRunning(true);
+                      const newId = crypto.randomUUID();
+                      setActivePaperSessionId(newId);
+                      setActivePaperSessionName(`${ps.name} (new)`);
+                      addAutoLog(`▶ Fresh start from "${ps.name}" — $${bal.toFixed(2)} · charts will fill as prices arrive`, "info");
+                    }
+                    setViewingSession(null);
+                  }}
+                  style={{ padding: "4px 10px", borderRadius: 6, fontSize: 11,
+                    border: "0.5px solid rgba(255,255,255,0.3)",
+                    background: "transparent", color: "rgba(255,255,255,0.8)",
+                    cursor: "pointer", fontFamily: "inherit" }}>
+                  + Fresh start
+                </button>
+              </>
+            )}
+            {viewingSession.isLive && !viewingSession.isRunning && (
+              <button onClick={() => { resumeServerSession(viewingSession.sessionId); setViewingSession(null); }}
+                style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                  background: "#10b981", color: "#fff", border: "none",
+                  cursor: "pointer", fontFamily: "inherit" }}>
+                ▶ Resume live session
+              </button>
+            )}
+            {viewingSession.isRunning && (
+              <button onClick={() => { stopServerSession(viewingSession.sessionId); setViewingSession(null); }}
+                style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                  background: "#ef444422", color: "#ef4444",
+                  border: "0.5px solid #ef444444",
+                  cursor: "pointer", fontFamily: "inherit" }}>
+                ⏹ Stop session
+              </button>
+            )}
+            {/* Details toggle — reopens the drawer if the user closed it */}
+            {!showViewerDrawer && (
+              <button onClick={() => setShowViewerDrawer(true)}
+                style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+                  border: "0.5px solid rgba(255,255,255,0.3)",
+                  background: "transparent", color: "rgba(255,255,255,0.85)",
+                  cursor: "pointer", fontFamily: "inherit" }}>
+                Details
+              </button>
+            )}
+            <button onClick={() => setViewingSession(null)}
+              title="Exit session view — return to live dashboard"
+              style={{ background: "none", border: "none", color: "rgba(255,255,255,0.5)",
+                fontSize: 18, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Session Viewer Panel ──────────────────────────────────────────────── */}
+      {viewingSession && showViewerDrawer && (() => {
+        const snap = viewingSession.snapshot || {};
+        const bal  = parseFloat(snap.sessionBalance || 0);
+        const coins = snap.enabledCoins || [];
+        const pnlByCoin = snap.pnlByCoin || snap.pnl_by_coin || {};
+        const totalPnl  = Object.values(pnlByCoin).reduce((a,b) => a+(parseFloat(b)||0), 0);
+        const trades    = snap.totalTrades || 0;
+        const logs      = snap.logs || [];
+        const rlState   = snap.rlTables || {};
+        const coinBals  = snap.coinBalances || snap.coin_balances || {};
+
+        return (
+          <>
+            {/* No backdrop — dashboard stays visible and interactive.
+                Drawer sits below the context bar (44px) on the right. */}
+            <div style={{
+              position:"fixed", top:44, right:0, bottom:0, width:340, zIndex:8600,
+              background:"var(--color-background-primary)",
+              borderLeft:"0.5px solid var(--color-border-tertiary)",
+              display:"flex", flexDirection:"column",
+              boxShadow:"-6px 0 24px rgba(0,0,0,0.3)",
+            }}>
+              {/* Header */}
+              <div style={{ padding:"14px 16px 12px",
+                borderBottom:"0.5px solid var(--color-border-tertiary)",
+                display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                <div style={{ minWidth:0 }}>
+                  <div style={{ fontSize:12, fontWeight:700,
+                    color:"var(--color-text-primary)",
+                    overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                    Session details
+                  </div>
+                  <div style={{ fontSize:10, color:"var(--color-text-tertiary)", marginTop:2 }}>
+                    RL state · settings · logs
+                  </div>
+                </div>
+                <button onClick={() => setShowViewerDrawer(false)}
+                  title="Hide details panel — dashboard stays in session view"
+                  style={{ width:26, height:26, borderRadius:"50%", border:"none",
+                    background:"var(--color-background-secondary)",
+                    color:"var(--color-text-secondary)", fontSize:14,
+                    cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>
+                  ×
+                </button>
+              </div>
+
+              <div style={{ flex:1, overflowY:"auto", padding:"16px 20px" }}>
+
+                {/* Note */}
+                <div style={{ padding:"8px 10px", borderRadius:7, marginBottom:14,
+                  background:"#6366f111", border:"0.5px solid #6366f133", fontSize:10,
+                  color:"#6366f1", lineHeight:1.5 }}>
+                  📊 The main dashboard on the left now shows this session's P&L,
+                  trades, positions and balance. Use the coin tabs to switch coins.
+                </div>
+
+                {/* RL Q-table summary */}
+                {Object.keys(rlState).length > 0 && (
+                  <div style={{ marginBottom:16 }}>
+                    <div style={{ fontSize:11, fontWeight:700, color:"var(--color-text-secondary)",
+                      marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>
+                      🎮 RL Agent State
+                    </div>
+                    {Object.entries(rlState).map(([coin, t]) => (
+                      <div key={coin} style={{ padding:"8px 12px", borderRadius:7, marginBottom:6,
+                        background:"var(--color-background-secondary)",
+                        border:"0.5px solid #6366f122" }}>
+                        <div style={{ display:"flex", justifyContent:"space-between",
+                          fontSize:11, marginBottom:4 }}>
+                          <span style={{ fontWeight:700, color:COIN_COLORS[coin]||"#6366f1" }}>{coin}</span>
+                          <span style={{ color:"var(--color-text-tertiary)" }}>
+                            {t.episodes || 0} episodes · ε={parseFloat(t.epsilon||0.4).toFixed(3)}
+                          </span>
+                        </div>
+                        <div style={{ fontSize:10, color:"var(--color-text-tertiary)" }}>
+                          {Object.keys(t.qTable||{}).length} states learned
+                          {t.episodes >= 20
+                            ? " · ✓ trained"
+                            : ` · needs ${20-(t.episodes||0)} more episodes`}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Session settings summary */}
+                {snap.creds && (
+                  <div style={{ marginBottom:16 }}>
+                    <div style={{ fontSize:11, fontWeight:700, color:"var(--color-text-secondary)",
+                      marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>
+                      Settings used
+                    </div>
+                    <div style={{ padding:"10px 12px", borderRadius:8,
+                      background:"var(--color-background-secondary)", fontSize:11,
+                      color:"var(--color-text-secondary)", lineHeight:1.8 }}>
+                      <div>Signal: <strong style={{ color:"var(--color-text-primary)" }}>{snap.signalSource || snap.creds?.signalSource || "rules"}</strong></div>
+                      <div>Coins: <strong style={{ color:"var(--color-text-primary)" }}>{coins.join(", ") || "—"}</strong></div>
+                      <div>Starting balance: <strong style={{ color:"var(--color-text-primary)" }}>${parseFloat(snap.creds?.tradeSizeUSD||50).toFixed(2)}</strong></div>
+                      <div>Exchange: <strong style={{ color:"var(--color-text-primary)" }}>{snap.creds?.provider || "binance"}</strong></div>
+                      {snap.creds?.tickIntervalMs && (
+                        <div>Tick interval: <strong style={{ color:"var(--color-text-primary)" }}>
+                          {snap.creds.tickIntervalMs >= 60000
+                            ? `${snap.creds.tickIntervalMs/60000}min`
+                            : `${snap.creds.tickIntervalMs/1000}s`}
+                        </strong></div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Logs */}
+                {logs.length > 0 && (
+                  <div>
+                    <div style={{ fontSize:11, fontWeight:700, color:"var(--color-text-secondary)",
+                      marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>
+                      Last {logs.length} log entries
+                    </div>
+                    <div style={{ borderRadius:8, overflow:"hidden",
+                      border:"0.5px solid var(--color-border-tertiary)" }}>
+                      {logs.slice(0,30).map((l, i) => {
+                        const msg  = typeof l === "string" ? l : l.msg || "";
+                        const type = typeof l === "string" ? "info" : l.type || "info";
+                        const time = typeof l === "string" ? "" : l.time || fmtTime(new Date(l.ts||""));
+                        const col  = type==="success"?"#10b981":type==="warn"?"#f59e0b":type==="error"?"#ef4444":"var(--color-text-secondary)";
+                        return (
+                          <div key={i} style={{ padding:"5px 10px", fontSize:10,
+                            borderBottom: i < logs.length-1 ? "0.5px solid var(--color-border-tertiary)" : "none",
+                            background: i%2===0 ? "var(--color-background-secondary)" : "var(--color-background-primary)",
+                            display:"flex", gap:8 }}>
+                            {time && <span style={{ color:"var(--color-text-tertiary)", flexShrink:0 }}>{time}</span>}
+                            <span style={{ color:col }}>{msg}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </>
+        );
+      })()}
+
+      {showSettings && (() => {
+        // When viewing a session, edit THAT session's settings, not the browser defaults
+        const viewedSnap     = viewingSession?.snapshot;
+        const sessionCreds   = viewedSnap?.creds && Object.keys(viewedSnap.creds).length > 0
+          ? viewedSnap.creds
+          : null;
+        const editingSession = !!sessionCreds && !!viewingSession;
+        const modalCreds     = editingSession ? sessionCreds : creds;
+
+        return (
+          <SettingsModal
+            creds={modalCreds}
+            limits={limits}
+            clerkPlan={clerkPlan}
+            forcedTab={tourActive ? tourForcedTab : null}
+            sessionContext={editingSession ? {
+              name:      viewingSession.name,
+              isRunning: viewingSession.isRunning,
+              isLive:    viewingSession.isLive,
+            } : null}
+            onSave={async (f) => {
+              setShowSettings(false);
+
+              // Always update browser creds AND localStorage immediately,
+              // regardless of whether we're editing a session or not.
+              // This ensures settings survive tab close in all cases.
+              if (!editingSession) {
+                setCreds(f);
+                // Belt-and-suspenders: write directly in addition to the useEffect
+                try {
+                  const { keys, ...safe } = f;
+                  localStorage.setItem("automation_trader_creds", JSON.stringify(safe));
+                } catch (_) {}
+                addAutoLog("⚙️ Settings saved", "info");
+              } else if (viewingSession.isRunning && viewingSession.sessionId) {
+                // Also push to the running server session
+                try {
+                  await serverFetch(`/sessions/${viewingSession.sessionId}`, {
+                    method: "PUT",
+                    body:   JSON.stringify({ creds: f }),
+                  });
+                  addAutoLog(`⚙️ Settings updated on session "${viewingSession.name}"`, "success");
+                  setViewingSession(prev => prev ? ({
+                    ...prev,
+                    snapshot: { ...prev.snapshot, creds: f },
+                  }) : null);
+                  fetchServerSessions();
+                } catch (e) {
+                  addAutoLog(`Settings push failed: ${e.message}`, "error");
+                }
+              } else {
+                // Stopped session — update the snapshot in memory
+                addAutoLog(`⚙️ Session settings updated (resume to apply)`, "info");
+                setViewingSession(prev => prev ? ({
+                  ...prev,
+                  snapshot: { ...prev.snapshot, creds: f },
+                }) : null);
+              }
+            }}
+            onClose={() => { setShowSettings(false); if (tourActive) setTourForcedTab(null); }}
+          />
+        );
+      })()}
 
       {/* ── Top toolbar ──────────────────────────────────────────────────────── */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
-        {COINS.map((c) => (
-          <button key={c} onClick={() => setSelectedCoin(c)}
-            style={{
-              padding: "5px 12px", borderRadius: 6, border: "0.5px solid",
-              borderColor: selectedCoin === c ? COIN_COLORS[c] : "var(--color-border-tertiary)",
-              background: selectedCoin === c ? COIN_COLORS[c] + "22" : "transparent",
-              color: selectedCoin === c ? COIN_COLORS[c] : "var(--color-text-secondary)",
-              cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 13,
-            }}>{c}</button>
-        ))}
+        {DISPLAY_COINS.map((c) => {
+          const inCurrent = !running || runningCoins.includes(c);
+          const isActive  = effectiveCoin === c;
+          return (
+            <button key={c} onClick={() => setSelectedCoin(c)}
+              title={!inCurrent && running ? `${c} is not in the active session` : undefined}
+              style={{
+                padding: "5px 12px", borderRadius: 6, border: "0.5px solid",
+                borderColor: isActive ? COIN_COLORS[c] : "var(--color-border-tertiary)",
+                background: isActive ? COIN_COLORS[c] + "22" : "transparent",
+                color: isActive ? COIN_COLORS[c] : !inCurrent ? "var(--color-text-tertiary)" : "var(--color-text-secondary)",
+                cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 13,
+                opacity: !inCurrent && running ? 0.45 : 1,
+              }}>
+              {c}
+              {!inCurrent && running && (
+                <span style={{ marginLeft: 3, fontSize: 9, color: "var(--color-text-tertiary)" }}>—</span>
+              )}
+            </button>
+          );
+        })}
 
         <div style={{ display: "flex", gap: 6, marginLeft: "auto", alignItems: "center", flexWrap: "wrap" }}>
           <label style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>Algo speed</label>
           <input type="range" min="400" max="3000" step="200" value={speed} onChange={(e) => setSpeed(+e.target.value)} style={{ width: 70 }} />
           <span style={{ fontSize: 11, color: "var(--color-text-secondary)", minWidth: 32 }}>{(speed / 1000).toFixed(1)}s</span>
 
-          <button onClick={() => setShowSettings(true)}
+          <button data-tour="settings-btn" onClick={() => setShowSettings(true)}
             style={{ padding: "5px 14px", borderRadius: 6, border: "0.5px solid var(--color-border-secondary)", background: "transparent", cursor: "pointer", fontFamily: "inherit", fontSize: 12, color: "var(--color-text-secondary)", display: "flex", alignItems: "center", gap: 5 }}>
             <i className="ti ti-settings" aria-hidden="true" /> Settings
             {hasCredentials && <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#10b981", display: "inline-block" }} />}
+          </button>
+
+          {/* Live session status + session manager button — always visible */}
+          <button data-tour="sessions-btn" onClick={() => setShowSessionMgr(s => !s)}
+            style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10,
+              padding: "3px 9px", borderRadius: 10, cursor: "pointer",
+              background: serverStatus === "running" ? "#10b98122" : serverStatus === "error" ? "#ef444422" : "var(--color-background-secondary)",
+              border: `0.5px solid ${serverStatus === "running" ? "#10b981" : serverStatus === "error" ? "#ef4444" : "var(--color-border-tertiary)"}`,
+              color: serverStatus === "running" ? "#10b981" : serverStatus === "error" ? "#ef4444" : "var(--color-text-tertiary)" }}>
+            <span style={{ width: 6, height: 6, borderRadius: "50%", display: "inline-block", flexShrink: 0,
+              background: serverStatus === "running" ? "#10b981" : serverStatus === "error" ? "#ef4444" : "#94a3b8",
+              boxShadow: serverStatus === "running" ? "0 0 4px #10b981" : "none" }} />
+            Sessions (Live {serverStatus === "running"
+              ? `${serverSessions.filter(s=>s.running).length} running`
+              : serverStatus === "auth_pending" ? "signing in…"
+              : serverStatus === "error" ? "error"
+              : serverStatus === "not_configured" ? "not set"
+              : !clerkLoaded ? "loading…"
+              : "idle"})
+            {serverSessions.length > 0 && <span style={{ marginLeft: 2 }}>({serverSessions.length})</span>}
+          </button>
+
+          {/* Marketplace button */}
+          <button
+            onClick={() => setShowMarketplace(s => !s)}
+            data-tour="marketplace-btn"
+            title="Browse and share trading strategies"
+            style={{ padding: "5px 12px", borderRadius: 6, fontSize: 12, fontWeight: 600,
+              border: `0.5px solid ${showMarketplace ? "#6366f1" : "var(--color-border-secondary)"}`,
+              background: showMarketplace ? "#6366f111" : "transparent",
+              color: showMarketplace ? "#6366f1" : "var(--color-text-secondary)",
+              cursor: "pointer", fontFamily: "inherit",
+              display: "flex", alignItems: "center", gap: 5 }}>
+            🌐 Marketplace
+          </button>
+
+          {/* Theme toggle */}
+          <button
+            onClick={toggleTheme}
+            title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            style={{ width: 26, height: 26, borderRadius: "50%",
+              border: "0.5px solid var(--color-border-secondary)",
+              background: "transparent",
+              color: "var(--color-text-secondary)", fontSize: 14,
+              cursor: "pointer", display: "flex", alignItems: "center",
+              justifyContent: "center" }}>
+            {theme === "dark" ? "☀️" : "🌙"}
+          </button>
+
+          {/* Restart tour button */}
+          <button
+            onClick={() => { setTourStep(0); setTourActive(true); }}
+            title="Show the setup tutorial"
+            style={{ width: 26, height: 26, borderRadius: "50%", border: "0.5px solid var(--color-border-secondary)",
+              background: "transparent", color: "var(--color-text-secondary)", fontSize: 13,
+              cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+              fontFamily: "inherit" }}>
+            ?
           </button>
 
           {/* User badge + plan + logout — only shown when Clerk is active */}
@@ -6040,18 +8643,36 @@ function CryptoAlgoTrader() {
 
           {cbError && <span style={{ fontSize: 11, color: "#ef4444", flex: 1 }}><i className="ti ti-alert-circle" aria-hidden="true" /> {cbError}</span>}
         {/* Session balance display */}
-        {running && sessionBalance !== null && (
+        {(running && sessionBalance !== null || (isViewing && viewedSessionData)) && (
           <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
-            <span style={{ color: "var(--color-text-tertiary)" }}>Trading balance:</span>
-            <span style={{ fontWeight: 700, color: sessionBalance >= parseFloat(creds.tradeSizeUSD || 50) ? "#10b981" : "#ef4444" }}>
-              ${sessionBalance.toFixed(2)}
+            <span style={{ color: "var(--color-text-tertiary)" }}>
+              {isViewing ? "Session balance:" : "Trading balance:"}
             </span>
-            {sessionBalance !== parseFloat(creds.tradeSizeUSD || 50) && (
-              <span style={{ fontSize: 10, color: sessionBalance >= parseFloat(creds.tradeSizeUSD || 50) ? "#10b981" : "#ef4444" }}>
-                ({sessionBalance >= parseFloat(creds.tradeSizeUSD || 50) ? "+" : ""}
-                ${(sessionBalance - parseFloat(creds.tradeSizeUSD || 50)).toFixed(2)} from start)
-              </span>
-            )}
+            {(() => {
+              const bal = isViewing
+                ? (viewedCoin?.balance || viewedSessionData?.eff.sessionBalance || 0)
+                : (sessionBalance || 0);
+              // For live (non-viewing) sessions, "start" is the balance at the
+              // moment THIS run began — fresh start or resume — not the session's
+              // original genesis balance. This makes "from start" mean "this run".
+              // For viewed sessions, use the coin's own starting allocation.
+              const start = isViewing
+                ? (viewedCoin?.allocated != null ? viewedCoin.allocated : parseFloat(displayCreds.tradeSizeUSD || 50))
+                : (sessionStartBalanceRef.current != null ? sessionStartBalanceRef.current : parseFloat(displayCreds.tradeSizeUSD || 50));
+              const diff  = bal - start;
+              return (
+                <>
+                  <span style={{ fontWeight: 700, color: bal >= start ? "#10b981" : "#ef4444" }}>
+                    ${bal.toFixed(2)}
+                  </span>
+                  {Math.abs(diff) > 0.01 && (
+                    <span style={{ fontSize: 10, color: diff >= 0 ? "#10b981" : "#ef4444" }}>
+                      ({diff >= 0 ? "+" : ""}${diff.toFixed(2)} from start)
+                    </span>
+                  )}
+                </>
+              );
+            })()}
           </div>
         )}
 
@@ -6082,48 +8703,257 @@ function CryptoAlgoTrader() {
                 <i className="ti ti-refresh" aria-hidden="true" />
               </button>
             )}
-            {!running ? (
-              <div style={{ display: "flex", gap: 6 }}>
-                {/* Simulation-only: no credentials needed */}
-                <button onClick={() => {
-                    const initBal = parseFloat(creds.tradeSizeUSD) || 50;
-                    sessionBalanceRef.current = initBal;
-                    setSessionBalance(initBal);
-                    setWsEnabled(true); setRunning(true);
-                    addAutoLog(`Simulation started — initial balance $${initBal.toFixed(2)}`, "info");
-                  }}
-                  style={{ padding: "6px 14px", borderRadius: 7, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-secondary)", color: "var(--color-text-secondary)", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
-                  <i className="ti ti-player-play" aria-hidden="true" /> Simulate
-                </button>
-                {/* Live automation: requires credentials + Pro plan */}
-                {!limits.canLive ? (
-                  <div style={{ padding: "6px 14px", borderRadius: 7, border: "0.5px solid #f59e0b", background: "#fef3c711", fontSize: 12, color: "#92400e", display: "flex", alignItems: "center", gap: 6 }}>
-                    🔒 Live trading requires{" "}
-                    <a href="/upgrade" style={{ color: "#f59e0b", fontWeight: 700, textDecoration: "none" }}>Pro plan</a>
+            {/* ── Trading Mode Controls ──────────────────────────────────────────── */}
+            {(() => {
+              const isSimRunning  = running && !autoEnabled;
+              const isLiveRunning = running && autoEnabled;
+              const serverRunning = serverSessions.some(s => s.running);
+
+              // STOPPED state
+              if (!running && !serverRunning) return (
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <button
+                    data-tour="paper-trade-btn"
+                    onClick={() => {
+                      const initBal = parseFloat(creds.tradeSizeUSD) || 50;
+                      sessionBalanceRef.current = initBal;
+                      sessionStartBalanceRef.current = initBal;
+                      setSessionBalance(initBal);
+                      // Reset all coin state so charts start clean
+                      for (const c of (creds.enabledCoins || COINS)) {
+                        if (!stateRef.current[c]) continue;
+                        const lastPrice = stateRef.current[c].prices.at(-1) || COIN_BASE[c] || 1;
+                        stateRef.current[c].prices   = [lastPrice];
+                        stateRef.current[c].volumes  = [1];
+                        stateRef.current[c].history  = [];
+                        stateRef.current[c].pnl      = 0;
+                        stateRef.current[c].trades   = 0;
+                        stateRef.current[c].position = null;
+                      }
+                      setViewingSession(null);
+                      setWsEnabled(true); setRunning(true);
+                      addAutoLog(`▶ Paper simulation started — $${initBal.toFixed(2)} · charts fill as prices arrive`, "info");
+                    }}
+                    style={{ padding: "7px 16px", borderRadius: 8,
+                      border: "0.5px solid #6366f1", background: "#6366f111",
+                      color: "#6366f1", cursor: "pointer", fontFamily: "inherit",
+                      fontWeight: 700, fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                    <i className="ti ti-flask" aria-hidden="true" />
+                    Paper trade
+                  </button>
+                  {limits.canLive ? (
+                    <button
+                      onClick={() => setShowSessionMgr(true)}
+                      disabled={!hasCredentials}
+                      title={!hasCredentials ? "Add API keys in Settings first" : "Start live trading"}
+                      style={{ padding: "7px 16px", borderRadius: 8,
+                        border: `0.5px solid ${hasCredentials ? "#10b981" : "var(--color-border-tertiary)"}`,
+                        background: hasCredentials ? "#10b98111" : "transparent",
+                        color: hasCredentials ? "#10b981" : "var(--color-text-tertiary)",
+                        cursor: hasCredentials ? "pointer" : "not-allowed",
+                        fontFamily: "inherit", fontWeight: 700, fontSize: 12,
+                        opacity: hasCredentials ? 1 : 0.5,
+                        display: "flex", alignItems: "center", gap: 6 }}>
+                      <i className="ti ti-robot" aria-hidden="true" />
+                      {hasCredentials ? "Go live" : "Add API keys first"}
+                    </button>
+                  ) : (
+                    <div style={{ padding: "7px 14px", borderRadius: 8,
+                      border: "0.5px solid #f59e0b44", background: "#f59e0b08",
+                      fontSize: 11, color: "#92400e", display: "flex", alignItems: "center", gap: 6 }}>
+                      🔒 <a href="/upgrade" style={{ color: "#f59e0b", fontWeight: 700, textDecoration: "none" }}>Upgrade to Pro</a> for live trading
+                    </div>
+                  )}
+                </div>
+              );
+
+              // PAPER TRADING state
+              if (isSimRunning) return (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    {/* Status pill */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px",
+                      borderRadius: 8, background: "#6366f111", border: "0.5px solid #6366f133",
+                      fontSize: 11, color: "#6366f1", fontWeight: 600 }}>
+                      <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#6366f1",
+                        boxShadow: "0 0 0 2px #6366f133", display: "inline-block" }} />
+                      Paper trading
+                    </div>
+                    {/* Pause/Resume */}
+                    <button onClick={() => setRunning(r => !r)}
+                      style={{ padding: "5px 12px", borderRadius: 7, fontSize: 11, fontWeight: 600,
+                        border: "0.5px solid var(--color-border-secondary)", background: "transparent",
+                        color: "var(--color-text-secondary)", cursor: "pointer", fontFamily: "inherit" }}>
+                      {running ? "⏸ Pause" : "▶ Resume"}
+                    </button>
+                    {/* Settings save (local) */}
+                    <button onClick={() => setShowSavedSims(s => !s)}
+                      title="Save simulation settings locally"
+                      style={{ padding: "5px 10px", borderRadius: 7, fontSize: 11,
+                        border: `0.5px solid ${showSavedSims?"#6366f1":"var(--color-border-secondary)"}`,
+                        background: showSavedSims?"#6366f111":"transparent",
+                        color: showSavedSims?"#6366f1":"var(--color-text-secondary)",
+                        cursor: "pointer", fontFamily: "inherit" }}>
+                      💾
+                    </button>
+                    {/* Save to server (optional, requires login) */}
+                    {clerkUser && (
+                      <button onClick={() => setShowSessionMgr(true)}
+                        title="Save this session to server so you can resume it later"
+                        style={{ padding: "5px 12px", borderRadius: 7, fontSize: 11, fontWeight: 600,
+                          border: "0.5px solid #6366f144", background: "#6366f108",
+                          color: "#6366f1", cursor: "pointer", fontFamily: "inherit",
+                          display: "flex", alignItems: "center", gap: 4 }}>
+                        ☁️ Save session
+                      </button>
+                    )}
+                    {/* Stop */}
+                    <button
+                      onClick={() => { setWsEnabled(false); setRunning(false); addAutoLog("Paper trading stopped", "info"); }}
+                      style={{ padding: "5px 12px", borderRadius: 7, fontSize: 11, fontWeight: 700,
+                        border: "0.5px solid #ef444466", background: "#ef444411",
+                        color: "#ef4444", cursor: "pointer", fontFamily: "inherit" }}>
+                      ⏹ Stop
+                    </button>
                   </div>
-                ) : (
-                  <button onClick={startAutomation} disabled={!hasCredentials}
-                    style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #10b981", background: hasCredentials ? "#d1fae5" : "transparent", color: hasCredentials ? "#065f46" : "var(--color-text-secondary)", cursor: hasCredentials ? "pointer" : "not-allowed", fontFamily: "inherit", fontWeight: 600, fontSize: 12, opacity: hasCredentials ? 1 : 0.4 }}>
-                    <i className="ti ti-robot" aria-hidden="true" /> {hasCredentials ? "Start live" : "No credentials"}
-                  </button>
-                )}
-              </div>
-            ) : (
-              <div style={{ display: "flex", gap: 6 }}>
-                {/* Pause algo loop without stopping automation */}
-                {autoEnabled && (
+                  {/* Auto-save status + feedback */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    {activePaperSessionId && (
+                      <div style={{ fontSize: 10, color: "var(--color-text-tertiary)",
+                        display: "flex", alignItems: "center", gap: 4 }}>
+                        <span style={{ width: 5, height: 5, borderRadius: "50%",
+                          background: "#6366f1", display: "inline-block" }} />
+                        Auto-saving "{activePaperSessionName}" every 5min
+                      </div>
+                    )}
+                    {paperSaveMsg && (
+                      <div style={{ fontSize: 11,
+                        color: paperSaveMsg.startsWith("✓") || paperSaveMsg.startsWith("⟳")
+                          ? "#10b981" : "#ef4444",
+                        padding: "2px 8px", borderRadius: 5,
+                        background: paperSaveMsg.startsWith("✓") || paperSaveMsg.startsWith("⟳")
+                          ? "#10b98111" : "#ef444411" }}>
+                        {paperSaveMsg}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+
+              // LIVE TRADING state (browser-initiated)
+              if (isLiveRunning) return (
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px",
+                    borderRadius: 8, background: "#10b98111", border: "0.5px solid #10b98133",
+                    fontSize: 11, color: "#10b981", fontWeight: 600 }}>
+                    <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#10b981",
+                      boxShadow: "0 0 0 2px #10b98133", display: "inline-block" }} />
+                    Live trading
+                  </div>
                   <button onClick={() => setRunning(r => !r)}
-                    style={{ padding: "6px 14px", borderRadius: 7, border: "0.5px solid var(--color-border-secondary)", background: "transparent", color: "var(--color-text-secondary)", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
-                    <i className={`ti ${running ? "ti-player-pause" : "ti-player-play"}`} aria-hidden="true" /> {running ? "Pause" : "Resume"}
+                    style={{ padding: "5px 12px", borderRadius: 7, fontSize: 11, fontWeight: 600,
+                      border: "0.5px solid var(--color-border-secondary)", background: "transparent",
+                      color: "var(--color-text-secondary)", cursor: "pointer", fontFamily: "inherit" }}>
+                    {running ? "⏸ Pause" : "▶ Resume"}
                   </button>
-                )}
-                <button onClick={autoEnabled ? stopAutomation : () => { setWsEnabled(false); setRunning(false); addAutoLog("Simulation stopped", "info"); }}
-                  style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #ef4444", background: "#fee2e2", color: "#991b1b", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
-                  <i className="ti ti-player-stop" aria-hidden="true" /> {autoEnabled ? "Stop live" : "Stop sim"}
+                  <button onClick={async () => { stopAutomation(); if (TRADING_SERVER) await stopServerSession(); }}
+                    style={{ padding: "5px 12px", borderRadius: 7, fontSize: 11, fontWeight: 700,
+                      border: "0.5px solid #ef444466", background: "#ef444411",
+                      color: "#ef4444", cursor: "pointer", fontFamily: "inherit" }}>
+                    ⏹ Stop
+                  </button>
+                </div>
+              );
+
+              // LIVE SESSION RUNNING (server-side, browser reconnected)
+              if (serverRunning) return (
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px",
+                    borderRadius: 8, background: "#10b98111", border: "0.5px solid #10b98133",
+                    fontSize: 11, color: "#10b981", fontWeight: 700 }}>
+                    <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#10b981",
+                      boxShadow: "0 0 0 2px #10b98133", display: "inline-block" }} />
+                    Live · {serverSessions.filter(s=>s.running).length} session{serverSessions.filter(s=>s.running).length>1?"s":""} running
+                  </div>
+                  <button onClick={() => setShowSessionMgr(true)}
+                    style={{ padding: "5px 12px", borderRadius: 7, fontSize: 11, fontWeight: 600,
+                      border: "0.5px solid #6366f166", background: "#6366f111",
+                      color: "#6366f1", cursor: "pointer", fontFamily: "inherit" }}>
+                    Manage sessions
+                  </button>
+                </div>
+              );
+
+              return null;
+            })()}
+          </div>
+
+          {/* ── Save/Load simulation panel ────────────────────────────────────── */}
+          {showSavedSims && !autoEnabled && (
+            <div style={{ margin: "10px 0", padding: "14px 16px", borderRadius: 10,
+              border: "0.5px solid #6366f144", background: "#6366f108" }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#6366f1", marginBottom: 10 }}>
+                💾 Simulation Settings
+              </div>
+
+              {/* Save current */}
+              <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                <input
+                  value={simSaveName}
+                  onChange={e => setSimSaveName(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && saveSimulation(simSaveName)}
+                  placeholder='Name this config (e.g. "RSI+MACD test")'
+                  style={{ flex: 1, fontSize: 11, padding: "5px 9px", borderRadius: 6,
+                    border: "0.5px solid var(--color-border-secondary)",
+                    background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}
+                />
+                <button onClick={() => saveSimulation(simSaveName)}
+                  disabled={!simSaveName.trim()}
+                  style={{ padding: "5px 14px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                    background: simSaveName.trim() ? "#6366f1" : "var(--color-background-secondary)",
+                    color: simSaveName.trim() ? "#fff" : "var(--color-text-tertiary)",
+                    border: "none", cursor: simSaveName.trim() ? "pointer" : "not-allowed", fontFamily: "inherit" }}>
+                  Save
                 </button>
               </div>
-            )}
-          </div>
+
+              {/* Saved list */}
+              {Object.keys(savedSims).length === 0 ? (
+                <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", textAlign: "center", padding: "10px 0" }}>
+                  No saved simulations yet. Type a name above and click Save.
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {Object.entries(savedSims).map(([name, sim]) => (
+                    <div key={name} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px",
+                      borderRadius: 7, background: "var(--color-background-secondary)",
+                      border: "0.5px solid var(--color-border-tertiary)" }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: "var(--color-text-primary)",
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
+                        <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
+                          {sim.savedAt} · P&L ${sim.totalPnl?.toFixed(2)||"0.00"} · bal ${sim.sessionBalance?.toFixed(2)||"?"}
+                          {" · "}{sim.creds?.signalSource || "rules"}{" · "}{sim.creds?.customCoins?.join(", ")||"BTC"}
+                        </div>
+                      </div>
+                      <button onClick={() => loadSimulation(name)}
+                        style={{ padding: "3px 10px", borderRadius: 5, fontSize: 10, fontWeight: 700,
+                          background: "#6366f1", color: "#fff", border: "none", cursor: "pointer", fontFamily: "inherit" }}>
+                        Load
+                      </button>
+                      <button onClick={() => deleteSimulation(name)}
+                        title="Delete"
+                        style={{ padding: "3px 7px", borderRadius: 5, fontSize: 12,
+                          background: "none", border: "none", cursor: "pointer", color: "#ef444488" }}>
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
         </div>
 
         {/* Automation log */}
@@ -6199,8 +9029,8 @@ function CryptoAlgoTrader() {
 
       {/* ── Ticker row ───────────────────────────────────────────────────────── */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8, marginBottom: 14 }}>
-        {COINS.map((c) => {
-          const cs = snapshot[c];
+        {DISPLAY_COINS.map((c) => {
+          const cs = isViewing ? (viewedSessionData?.coinData[c] || snapshot[c]) : snapshot[c];
           const p = cs.prices[cs.prices.length - 1];
           const chg = cs.prices.length > 1 ? ((p - cs.prices[0]) / cs.prices[0]) * 100 : 0;
           const isLive = autoEnabled && creds.enabledCoins.includes(c);
@@ -6274,7 +9104,9 @@ function CryptoAlgoTrader() {
           </div>}
         </div>
         <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px" }}>
-          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 6 }}>{"Cumulative P&L (%)"}</div>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 6 }}>
+            {isViewing ? "Session P&L" : running ? `P&L — ${effectiveCoin} (this run)` : "Cumulative P&L"}
+          </div>
           <ResponsiveContainer width="100%" height={80}>
             <LineChart data={pnlData} margin={{ top: 2, right: 4, left: 0, bottom: 0 }}>
               <XAxis dataKey="i" hide />
@@ -6285,7 +9117,17 @@ function CryptoAlgoTrader() {
             </LineChart>
           </ResponsiveContainer>
           <div style={{ fontSize: 11, marginTop: 4, color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
-            {"$"}{(coin.pnl + unrealizedDollar).toFixed(2)}{" - "}{coin.trades}{" trades"}
+            {!coinInSession && running ? (
+              <span style={{ color: "var(--color-text-tertiary)" }}>{effectiveCoin} not in session</span>
+            ) : coin.position && coin.trades === 0 ? (
+              // Open position, no closed trades yet — the number shown is purely unrealized
+              <>
+                {"$"}{(coin.pnl + unrealizedDollar).toFixed(2)}
+                <span style={{ color: "var(--color-text-tertiary)" }}> (unrealized · position still open, 0 closed)</span>
+              </>
+            ) : (
+              `$${(coin.pnl + unrealizedDollar).toFixed(2)} — ${coin.trades} trade${coin.trades !== 1 ? "s" : ""}`
+            )}
           </div>
         </div>
       </div>
@@ -6302,20 +9144,20 @@ function CryptoAlgoTrader() {
                 <div style={{ flex: 1 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--color-text-secondary)", marginBottom: 3 }}>
                     <span>Indicator agreement</span>
-                    <span style={{ fontWeight: 600, color: parseFloat(lastH.confidence) >= parseFloat(creds.minConfidence) ? "#10b981" : "#f59e0b" }}>
+                    <span style={{ fontWeight: 600, color: parseFloat(lastH.confidence) >= parseFloat(displayCreds.minConfidence) ? "#10b981" : "#f59e0b" }}>
                       {lastH.confidence}%
                       {lastH.agreeingCount != null && ` (${lastH.agreeingCount}/${lastH.totalIndicators} agree)`}
                     </span>
                   </div>
                   <div style={{ height: 6, background: "var(--color-border-tertiary)", borderRadius: 3, overflow: "hidden", position: "relative" }}>
                     <div style={{ width: lastH.confidence + "%", height: "100%", borderRadius: 3,
-                      background: parseFloat(lastH.confidence) >= parseFloat(creds.minConfidence) ? "#10b981" : "#f59e0b",
+                      background: parseFloat(lastH.confidence) >= parseFloat(displayCreds.minConfidence) ? "#10b981" : "#f59e0b",
                       transition: "width 0.3s ease" }} />
                     {/* Threshold marker */}
-                    <div style={{ position: "absolute", top: 0, left: creds.minConfidence + "%", width: 2, height: "100%", background: "#6366f1" }} />
+                    <div style={{ position: "absolute", top: 0, left: displayCreds.minConfidence + "%", width: 2, height: "100%", background: "#6366f1" }} />
                   </div>
                   <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2, display: "flex", justifyContent: "space-between" }}>
-                    <span>threshold: {creds.minConfidence}% <span style={{ color: "#6366f1" }}>│</span></span>
+                    <span>threshold: {displayCreds.minConfidence}% <span style={{ color: "#6366f1" }}>│</span></span>
                     <span>score: <strong style={{ color: lastH.score > 0 ? "#10b981" : lastH.score < 0 ? "#ef4444" : "var(--color-text-secondary)" }}>{lastH.score > 0 ? "+" : ""}{lastH.score}</strong></span>
                   </div>
                 </div>
@@ -6324,17 +9166,102 @@ function CryptoAlgoTrader() {
               {/* Buy gate status */}
               {lastH.action === "BUY" && lastH.agreeingCount != null && (
                 <div style={{ fontSize: 10, marginBottom: 8, padding: "4px 8px", borderRadius: 5,
-                  background: (parseFloat(lastH.confidence) >= parseFloat(creds.minConfidence) && lastH.agreeingCount >= 3) ? "#d1fae5" : "#fef3c7",
-                  color: (parseFloat(lastH.confidence) >= parseFloat(creds.minConfidence) && lastH.agreeingCount >= 3) ? "#065f46" : "#92400e" }}>
-                  {parseFloat(lastH.confidence) >= parseFloat(creds.minConfidence) && lastH.agreeingCount >= 3
+                  background: (parseFloat(lastH.confidence) >= parseFloat(displayCreds.minConfidence) && lastH.agreeingCount >= 3) ? "#d1fae5" : "#fef3c7",
+                  color: (parseFloat(lastH.confidence) >= parseFloat(displayCreds.minConfidence) && lastH.agreeingCount >= 3) ? "#065f46" : "#92400e" }}>
+                  {parseFloat(lastH.confidence) >= parseFloat(displayCreds.minConfidence) && lastH.agreeingCount >= 3
                     ? `✓ BUY gate passed — ${lastH.agreeingCount} indicators agree, confidence above threshold`
-                    : `⚠ BUY suppressed — ${parseFloat(lastH.confidence) < parseFloat(creds.minConfidence) ? `confidence ${lastH.confidence}% below ${creds.minConfidence}% threshold` : `only ${lastH.agreeingCount}/3 indicators agree`}`}
+                    : `⚠ BUY suppressed — ${parseFloat(lastH.confidence) < parseFloat(displayCreds.minConfidence) ? `confidence ${lastH.confidence}% below ${displayCreds.minConfidence}% threshold` : `only ${lastH.agreeingCount}/3 indicators agree`}`}
                 </div>
               )}
 
-              {/* Per-indicator breakdown */}
+              {/* Signal source badge */}
+              <div style={{ marginBottom: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {[
+                  lastH.fromCustomRules && { icon: "⚙️", label: "Custom Rules", color: "#10b981" },
+                  lastH.fromRL          && { icon: "🎮", label: `RL (ep:${lastH.rlEpisodes} ε:${lastH.rlEpsilon})`, color: "#6366f1" },
+                  lastH.fromRF          && { icon: "🌲", label: `RF (P↑:${lastH.rfDirProb})`, color: "#f59e0b" },
+                  lastH.fromLSTM        && { icon: "🧠", label: "LSTM", color: "#8b5cf6" },
+                ].filter(Boolean).map((b, i) => (
+                  <span key={i} style={{ fontSize: 10, padding: "2px 8px", borderRadius: 5, fontWeight: 700,
+                    background: b.color + "20", color: b.color, border: `0.5px solid ${b.color}44` }}>
+                    {b.icon} {b.label}
+                  </span>
+                ))}
+              </div>
+
+              {/* LSTM parameters */}
+              {lastH.lstmTrend != null && (
+                <div style={{ marginBottom: 8, padding: "7px 10px", borderRadius: 7,
+                  background: "#8b5cf608", border: "0.5px solid #8b5cf622", fontSize: 10 }}>
+                  <div style={{ fontWeight: 600, color: "#8b5cf6", marginBottom: 4 }}>🧠 LSTM parameters</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6 }}>
+                    {[
+                      { label: "Trend",     val: lastH.lstmTrend,   color: parseFloat(lastH.lstmTrend) > 0 ? "#10b981" : "#ef4444" },
+                      { label: "Δ5 ticks",  val: lastH.lstmChange ? lastH.lstmChange + "%" : "n/a", color: parseFloat(lastH.lstmChange) > 0 ? "#10b981" : "#ef4444" },
+                      { label: "Volatility",val: lastH.lstmVol,     color: "var(--color-text-primary)" },
+                      { label: "P(up)",     val: lastH.lstmDirProb, color: parseFloat(lastH.lstmDirProb) > 0.55 ? "#10b981" : parseFloat(lastH.lstmDirProb) < 0.45 ? "#ef4444" : "#94a3b8" },
+                    ].map(m => (
+                      <div key={m.label} style={{ textAlign: "center" }}>
+                        <div style={{ color: "var(--color-text-tertiary)", marginBottom: 1 }}>{m.label}</div>
+                        <div style={{ fontWeight: 700, color: m.color }}>{m.val ?? "…"}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* RF + RL row */}
+              {(lastH.rfDirProb != null || lastH.rlAction) && (
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  {lastH.rfDirProb != null && (
+                    <div style={{ flex: 1, padding: "6px 8px", borderRadius: 7, background: "#f59e0b08",
+                      border: "0.5px solid #f59e0b22", fontSize: 10 }}>
+                      <div style={{ fontWeight: 600, color: "#f59e0b", marginBottom: 3 }}>🌲 Random Forest</div>
+                      <div style={{ color: "var(--color-text-secondary)" }}>
+                        P(up): <strong style={{ color: parseFloat(lastH.rfDirProb) > 0.55 ? "#10b981" : "#ef4444" }}>{lastH.rfDirProb}</strong>
+                        {lastH.rfTrainedOn && <span style={{ color: "var(--color-text-tertiary)", marginLeft: 5 }}>n={lastH.rfTrainedOn}</span>}
+                      </div>
+                    </div>
+                  )}
+                  {lastH.rlAction && (
+                    <div style={{ flex: 1, padding: "6px 8px", borderRadius: 7, background: "#6366f108",
+                      border: "0.5px solid #6366f122", fontSize: 10 }}>
+                      <div style={{ fontWeight: 600, color: "#6366f1", marginBottom: 3 }}>🎮 RL Agent</div>
+                      <div style={{ color: "var(--color-text-secondary)" }}>
+                        <strong style={{ color: lastH.rlAction==="BUY"?"#10b981":lastH.rlAction==="SELL"?"#ef4444":"#94a3b8" }}>{lastH.rlAction}</strong>
+                        <span style={{ color: "var(--color-text-tertiary)", marginLeft: 5 }}>Q=[{lastH.rlQValues?.join(", ")}]</span>
+                      </div>
+                      <div style={{ color: "var(--color-text-tertiary)", marginTop: 1 }}>ep:{lastH.rlEpisodes} ε:{lastH.rlEpsilon}</div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Indicator values */}
+              {lastH.indicators && (
+                <div style={{ marginBottom: 8, display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 4 }}>
+                  {[
+                    { k: "RSI",       v: lastH.indicators.rsi,         warn: parseFloat(lastH.indicators.rsi) < 30 || parseFloat(lastH.indicators.rsi) > 70 },
+                    { k: "MACD",      v: lastH.indicators.macd,        warn: false },
+                    { k: "Boll%B",    v: lastH.indicators.bollingerPct, warn: false },
+                    { k: "Vol",       v: lastH.indicators.volume ? lastH.indicators.volume + "×" : null, warn: parseFloat(lastH.indicators.volume) > 1.5 },
+                    { k: "SMA20%",    v: lastH.indicators.sma20dist ? lastH.indicators.sma20dist + "%" : null, warn: false },
+                    { k: "SMA50%",    v: lastH.indicators.sma50dist ? lastH.indicators.sma50dist + "%" : null, warn: false },
+                    { k: "ATR%",      v: lastH.indicators.atrPct ? lastH.indicators.atrPct + "%" : null, warn: false },
+                    { k: "Score",     v: lastH.score, warn: false },
+                  ].map(({ k, v, warn }) => v != null && (
+                    <div key={k} style={{ fontSize: 9, textAlign: "center", padding: "3px 4px", borderRadius: 4,
+                      background: warn ? "#f59e0b11" : "var(--color-background-primary)" }}>
+                      <div style={{ color: "var(--color-text-tertiary)" }}>{k}</div>
+                      <div style={{ fontWeight: 700, color: warn ? "#f59e0b" : "var(--color-text-primary)" }}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Per-indicator reason breakdown */}
               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {lastH.reasons.map((r, i) => {
+                {lastH.reasons?.map((r, i) => {
                   const item = typeof r === "object" ? r : { label: r, vote: 0 };
                   const voteColor = item.vote === 1 ? "#10b981" : item.vote === -1 ? "#ef4444" : "#94a3b8";
                   const icon = item.vote === 1 ? "ti-arrow-up" : item.vote === -1 ? "ti-arrow-down" : "ti-minus";
@@ -6344,25 +9271,37 @@ function CryptoAlgoTrader() {
                       background: item.vote !== 0 ? voteColor + "11" : "transparent" }}>
                       <i className={`ti ${icon}`} aria-hidden="true" style={{ color: voteColor, fontSize: 12, flexShrink: 0 }} />
                       <span style={{ color: "var(--color-text-secondary)", flex: 1 }}>{item.label}</span>
-                      {item.vote !== 0 && (
-                        <span style={{ fontSize: 10, fontWeight: 600, color: voteColor }}>
-                          {item.vote === 1 ? "BULL" : "BEAR"}
-                        </span>
-                      )}
+                      {item.vote !== 0 && <span style={{ fontSize: 10, fontWeight: 600, color: voteColor }}>{item.vote === 1 ? "BULL" : "BEAR"}</span>}
                     </div>
                   );
                 })}
               </div>
+
+              {/* Custom exit rules that fired */}
+              {lastH.customExitsFired?.length > 0 && (
+                <div style={{ marginTop: 6, padding: "5px 8px", borderRadius: 5,
+                  background: "#f59e0b11", border: "0.5px solid #f59e0b33", fontSize: 10, color: "#92400e" }}>
+                  🎯 Exit rules: {lastH.customExitsFired.join(", ")}
+                </div>
+              )}
             </>
           ) : (
-            <div style={{ color: "var(--color-text-secondary)", fontSize: 12 }}>Press Start to begin analysis</div>
+            <div style={{ color: "var(--color-text-secondary)", fontSize: 12 }}>
+              {running
+                ? !coinInSession
+                  ? `${effectiveCoin} is not in this session — select a session coin above`
+                  : "Waiting for first tick…"
+                : "Press Start to begin analysis"}
+            </div>
           )}
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
 
           {/* ── Position panel ──────────────────────────────────────────────── */}
-          <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: `0.5px solid ${coin.position ? (unrealized >= 0 ? "#10b981" : "#ef4444") : "var(--color-border-tertiary)"}`, padding: "12px", flex: 1 }}>
+          <div style={{ background: "var(--color-background-secondary)", borderRadius: 10,
+            border: `0.5px solid ${!coinInSession && running ? "var(--color-border-tertiary)" : coin.position ? (unrealized >= 0 ? "#10b981" : "#ef4444") : "var(--color-border-tertiary)"}`,
+            padding: "12px", flex: 1 }}>
             <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8, display: "flex", justifyContent: "space-between" }}>
               <span>{"Position - "}{selectedCoin}{"/USD"}</span>
               {coin.position?.manual      && <span style={{ fontSize: 10, color: "#f59e0b",  fontWeight: 600 }}>MANUAL</span>}
@@ -6370,7 +9309,7 @@ function CryptoAlgoTrader() {
               {coin.position?.algoOwned && !coin.position.manual && autoEnabled && <span style={{ fontSize: 10, color: "#6366f1" }}><i className="ti ti-robot" aria-hidden="true" /> ALGO</span>}
             </div>
             {coin.position ? (() => {
-              const er = creds.exitRules?.[selectedCoin] || {};
+              const er = displayCreds.exitRules?.[selectedCoin] || {};
               const ep = coin.position.price;
               const resolveLevel = (type, val, dir) => {
                 const v = parseFloat(val) || 0; if (!v) return null;
@@ -6383,9 +9322,9 @@ function CryptoAlgoTrader() {
                 <div style={{ fontSize: 11, marginBottom: 3 }}>Qty: <strong>{(coin.position.size || 0).toFixed(8)} {selectedCoin}</strong></div>
                 <div style={{ fontSize: 11, marginBottom: 3 }}>Now: <strong>${fmt(currentPrice, 2)}</strong></div>
                 {(() => {
-                  const fee = parseFloat(creds.feePercent) || 0;
+                  const fee = parseFloat(displayCreds.feePercent) || 0;
                   const breakEven = ep * (1 + fee / 100) / (1 - fee / 100);
-                  const netPnl = calcProfit(ep, currentPrice, coin.position.size || 0, creds.feePercent);
+                  const netPnl = calcProfit(ep, currentPrice, coin.position.size || 0, displayCreds.feePercent);
                   return (<>
                     <div style={{ fontSize: 13, fontWeight: 700, color: netPnl >= 0 ? "#10b981" : "#ef4444", marginBottom: 4 }}>
                       {netPnl >= 0 ? "+" : ""}{"$"}{Math.abs(netPnl).toFixed(2)}{" ("}{fmtPct(unrealized)}{")"}
@@ -6403,12 +9342,12 @@ function CryptoAlgoTrader() {
                   </div>
                 )}
                 {/* Dynamic exit scaling status */}
-                {creds.dynamicExits?.enabled && (() => {
-                  const totalPnl = creds.dynamicExits.scaleBy === "per_coin"
+                {displayCreds.dynamicExits?.enabled && (() => {
+                  const totalPnl = displayCreds.dynamicExits.scaleBy === "per_coin"
                     ? coin.pnl
                     : COINS.reduce((sum, c) => sum + (snapshot?.[c]?.pnl || 0), 0);
-                  const pt = parseFloat(creds.dynamicExits.profitThreshold) || 20;
-                  const lt = parseFloat(creds.dynamicExits.lossThreshold) || -20;
+                  const pt = parseFloat(displayCreds.dynamicExits.profitThreshold) || 20;
+                  const lt = parseFloat(displayCreds.dynamicExits.lossThreshold) || -20;
                   const isWinning = totalPnl > pt;
                   const isLosing  = totalPnl < lt;
                   if (!isWinning && !isLosing) return null;
@@ -6427,16 +9366,16 @@ function CryptoAlgoTrader() {
                   <span>↓ SL</span><strong>${fmt(sl, 2)}</strong>
                 </div>}
                 {/* Trailing take-profit status */}
-                {creds.exitStrategies?.trailingTakeProfit?.enabled && coin.position && (() => {
+                {displayCreds.exitStrategies?.trailingTakeProfit?.enabled && coin.position && (() => {
                   const ttp = trailingTpRef.current[selectedCoin];
-                  const er = creds.exitRules?.[selectedCoin] || {};
+                  const er = displayCreds.exitRules?.[selectedCoin] || {};
                   const tpPrice = coin.position.price && er.takeProfitValue
                     ? er.takeProfitType === "percent"
                       ? coin.position.price * (1 + parseFloat(er.takeProfitValue) / 100)
                       : coin.position.price + parseFloat(er.takeProfitValue)
                     : null;
                   if (ttp?.armed) {
-                    const reversalPx = ttp.peak * (1 - (parseFloat(creds.exitStrategies.trailingTakeProfit.trailPercent) || 1) / 100);
+                    const reversalPx = ttp.peak * (1 - (parseFloat(displayCreds.exitStrategies.trailingTakeProfit.trailPercent) || 1) / 100);
                     return (
                       <div style={{ fontSize: 10, color: "#10b981", marginBottom: 2 }}>
                         <div style={{ display: "flex", justifyContent: "space-between" }}>
@@ -6454,11 +9393,11 @@ function CryptoAlgoTrader() {
                     </div>
                   ) : null;
                 })()}
-                {creds.exitStrategies?.trailingStop?.enabled && trailingHighRef.current[selectedCoin] && (
+                {displayCreds.exitStrategies?.trailingStop?.enabled && trailingHighRef.current[selectedCoin] && (
                   <div style={{ fontSize: 10, color: "#f59e0b", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                     <span>~ Trail stop</span>
                 <strong>{(() => {
-                      const ts   = creds.exitStrategies?.trailingStop || {};
+                      const ts   = displayCreds.exitStrategies?.trailingStop || {};
                       const peak = trailingHighRef.current[selectedCoin];
                       if (!peak) return "—";
                       const val  = parseFloat(ts.trailPercent) || 1.5;
@@ -6471,28 +9410,34 @@ function CryptoAlgoTrader() {
                 {autoEnabled && (
                   <div style={{ fontSize: 10, marginTop: 4, display: "flex", justifyContent: "space-between", gap: 8 }}>
                     <span style={{ color: "var(--color-text-tertiary)" }}>
-                      BUY: <strong style={{ color: creds.buyOrderConfig?.type === "limit" ? "#10b981" : "var(--color-text-secondary)" }}>
-                        {creds.buyOrderConfig?.type === "limit"
-                          ? `limit +${creds.buyOrderConfig.limitOffsetValue}${creds.buyOrderConfig.limitOffsetType === "percent" ? "%" : "$"}`
+                      BUY: <strong style={{ color: displayCreds.buyOrderConfig?.type === "limit" ? "#10b981" : "var(--color-text-secondary)" }}>
+                        {displayCreds.buyOrderConfig?.type === "limit"
+                          ? `limit +${displayCreds.buyOrderConfig.limitOffsetValue}${displayCreds.buyOrderConfig.limitOffsetType === "percent" ? "%" : "$"}`
                           : "market"}
                       </strong>
                     </span>
                     <span style={{ color: "var(--color-text-tertiary)" }}>
                       SELL: <strong style={{ color: "#6366f1" }}>
-                        {(creds.sellOrderConfig?.type || "market").replace(/_/g, " ")}
+                        {(displayCreds.sellOrderConfig?.type || "market").replace(/_/g, " ")}
                       </strong>
                     </span>
                   </div>
                 )}
-                {creds.exitStrategies?.timeExit?.enabled && coin.position && (
+                {displayCreds.exitStrategies?.timeExit?.enabled && coin.position && (
                   <div style={{ fontSize: 10, color: "#a855f7", display: "flex", justifyContent: "space-between" }}>
                     <span>⏱ Max hold</span>
-                    <strong>{creds.exitStrategies.timeExit.maxHoldMinutes}m</strong>
+                    <strong>{displayCreds.exitStrategies.timeExit.maxHoldMinutes}m</strong>
                   </div>
                 )}
               </>);
             })() : (
-              <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>No open position</div>
+              <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>
+                {!coinInSession && running
+                  ? `${effectiveCoin} is not in the active session`
+                  : running
+                    ? "No open position — watching for signal"
+                    : "No open position"}
+              </div>
             )}
           </div>
 

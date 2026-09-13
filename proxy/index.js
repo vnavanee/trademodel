@@ -724,16 +724,26 @@ exports.ticker = async (req, res) => {
 
   // ── Auth-gated routes (only when middleware is loaded) ──────────────────────
   if (authMiddleware) {
-    const { handleGetSettings, handlePutSettings,
-            handlePostTransaction, handleGetTransactions,
-            handleSubscribe, handleStripeWebhook, handleUserCreated } = authMiddleware;
-    if (route === "/settings"     && req.method === "GET")  return handleGetSettings(req, res);
-    if (route === "/settings"     && req.method === "PUT")  return handlePutSettings(req, res);
-    if (route === "/transactions" && req.method === "POST") return handlePostTransaction(req, res);
-    if (route === "/transactions" && req.method === "GET")  return handleGetTransactions(req, res);
-    if (route === "/subscribe"    && req.method === "POST") return handleSubscribe(req, res);
+    const {
+      handleGetSettings, handlePutSettings,
+      handlePostTransaction, handleGetTransactions,
+      handleSubscribe, handleStripeWebhook, handleUserCreated,
+      // Paper session handlers — present in updated proxy_auth_middleware.js
+      handleListPaperSessions   = () => res.status(501).json({ error: "Paper sessions not available — redeploy proxy_auth_middleware.js" }),
+      handleSavePaperSession    = () => res.status(501).json({ error: "Paper sessions not available — redeploy proxy_auth_middleware.js" }),
+      handleDeletePaperSession  = () => res.status(501).json({ error: "Paper sessions not available — redeploy proxy_auth_middleware.js" }),
+    } = authMiddleware;
+    if (route === "/settings"      && req.method === "GET")  return handleGetSettings(req, res);
+    if (route === "/settings"      && req.method === "PUT")  return handlePutSettings(req, res);
+    if (route === "/transactions"  && req.method === "POST") return handlePostTransaction(req, res);
+    if (route === "/transactions"  && req.method === "GET")  return handleGetTransactions(req, res);
+    if (route === "/subscribe"     && req.method === "POST") return handleSubscribe(req, res);
     if ((route === "/webhook"  || route === "/webhook/")  && req.method === "POST") return handleStripeWebhook(req, res);
     if ((route === "/users"    || route === "/users/")    && req.method === "POST") return handleUserCreated(req, res);
+    // Paper session persistence (browser-side trading, saved to Supabase)
+    if (route === "/paper-sessions" && req.method === "GET")  return handleListPaperSessions(req, res);
+    if (route === "/paper-sessions" && req.method === "POST") return handleSavePaperSession(req, res);
+    if (route.startsWith("/paper-sessions/") && req.method === "DELETE") return handleDeletePaperSession(req, res);
   }
 
   // ── POST /advancedbuy ────────────────────────────────────────────────────

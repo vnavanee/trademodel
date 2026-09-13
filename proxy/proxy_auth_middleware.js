@@ -580,6 +580,102 @@ function readRawBody(req) {
   });
 }
 
+// ─── Paper Session Handlers ───────────────────────────────────────────────────
+// Persists browser-based paper trading sessions to Supabase via Cloud Run proxy.
+// No VPS required — all trading still runs in the browser.
+// Schema: paper_sessions table (see supabase_schema.sql additions)
+
+async function handleListPaperSessions(req, res) {
+  const auth = await requireAuth(req, res); if (!auth) return;
+  const sb   = getSupabase();
+  const { data, error } = await sb
+    .from("paper_sessions")
+    .select("*")
+    .eq("user_id", auth.userId)
+    .order("updated_at", { ascending: false })
+    .limit(20);
+  if (error) {
+    console.error("[paper-sessions/list]", {
+      code: error.code, message: error.message, hint: error.hint,
+    });
+    if (error.code === "42P01") {
+      console.error("[paper-sessions/list] Table 'paper_sessions' does not exist — run supabase_trading_sessions.sql");
+      return res.status(200).json({ sessions: [] }); // degrade gracefully
+    }
+    return res.status(500).json({ error: "Unable to load sessions. Please try again." });
+  }
+  res.status(200).json({ sessions: data || [] });
+}
+
+async function handleSavePaperSession(req, res) {
+  const auth = await requireAuth(req, res); if (!auth) return;
+  let body;
+  try { body = typeof req.body === "string" ? JSON.parse(req.body) : req.body; }
+  catch { return res.status(400).json({ error: "Invalid request format. Please try again." }); }
+
+  const { sessionId, name, snapshot } = body || {};
+  if (!name || !snapshot) return res.status(400).json({ error: "Missing name or snapshot" });
+
+  const sb  = getSupabase();
+  const id  = sessionId || require("crypto").randomUUID();
+
+  // Sanitise snapshot — strip large ML model weights, keep Q-tables and state
+  const safe = {
+    creds:          snapshot.creds          || {},
+    coinBalances:   snapshot.coinBalances   || {},
+    positions:      snapshot.positions      || {},
+    pnlByCoin:      snapshot.pnlByCoin      || {},
+    tradesByCoin:   snapshot.tradesByCoin   || {},
+    totalTrades:    snapshot.totalTrades    || 0,
+    sessionBalance: snapshot.sessionBalance || 0,
+    rlTables:       snapshot.rlTables       || {},  // Q-tables serialised
+    logs:           (snapshot.logs          || []).slice(0, 30),
+    enabledCoins:   snapshot.enabledCoins   || [],
+    signalSource:   snapshot.signalSource   || "rules",
+    savedAt:        new Date().toISOString(),
+  };
+
+  const { error } = await sb.from("paper_sessions").upsert({
+    session_id:   id,
+    user_id:      auth.userId,
+    name:         name.trim().slice(0, 80),
+    snapshot:     safe,
+    updated_at:   new Date().toISOString(),
+    // created_at intentionally omitted — DB default handles it on insert,
+    // and we don't overwrite it on update
+  }, { onConflict: "session_id", ignoreDuplicates: false });
+
+  if (error) {
+    console.error("[paper-sessions/save]", {
+      code:    error.code,
+      message: error.message,
+      details: error.details,
+      hint:    error.hint,
+    });
+    // Common errors with hints
+    if (error.code === "42P01") {
+      console.error("[paper-sessions/save] Table 'paper_sessions' does not exist — run supabase_trading_sessions.sql");
+    }
+    return res.status(500).json({ error: "Unable to save session. Please try again." });
+  }
+  res.status(200).json({ ok: true, sessionId: id });
+}
+
+async function handleDeletePaperSession(req, res) {
+  const auth = await requireAuth(req, res); if (!auth) return;
+  const url  = new URL(req.url, "http://localhost");
+  const id   = url.pathname.split("/").pop();
+  if (!id) return res.status(400).json({ error: "Missing session ID" });
+  const sb   = getSupabase();
+  const { error } = await sb.from("paper_sessions")
+    .delete().eq("session_id", id).eq("user_id", auth.userId);
+  if (error) {
+    console.error("[paper-sessions/delete]", error.code, error.message);
+    return res.status(500).json({ error: "Unable to delete session. Please try again." });
+  }
+  res.status(200).json({ ok: true });
+}
+
 // ─── ROUTE REGISTRATION ───────────────────────────────────────────────────────
 // Add these to your main request handler switch/if-else block in index.js:
 //
@@ -587,15 +683,18 @@ function readRawBody(req) {
 //   if (route === "/settings" && req.method === "PUT")  return handlePutSettings(req, res);
 //   if (route === "/transactions" && req.method === "POST") return handlePostTransaction(req, res);
 //   if (route === "/transactions" && req.method === "GET")  return handleGetTransactions(req, res);
-//   if (route === "/subscribe" && req.method === "POST") return handleSubscribe(req, res);
-//   if (route === "/webhook"   && req.method === "POST") return handleStripeWebhook(req, res);
-//   if (route === "/users"     && req.method === "POST") return handleUserCreated(req, res);
+//   if (route === "/subscribe"    && req.method === "POST") return handleSubscribe(req, res);
+//   if (route === "/webhook"      && req.method === "POST") return handleStripeWebhook(req, res);
+//   if (route === "/users"        && req.method === "POST") return handleUserCreated(req, res);
+//   if (route === "/paper-sessions" && req.method === "GET")    return handleListPaperSessions(req, res);
+//   if (route === "/paper-sessions" && req.method === "POST")   return handleSavePaperSession(req, res);
+//   if (route.startsWith("/paper-sessions/") && req.method === "DELETE") return handleDeletePaperSession(req, res);
 
 module.exports = {
   requireAuth, requirePlan,
   handleGetSettings, handlePutSettings,
   handlePostTransaction, handleGetTransactions,
   handleSubscribe, handleStripeWebhook, handleUserCreated,
+  handleListPaperSessions, handleSavePaperSession, handleDeletePaperSession,
   encryptCreds, decryptCreds,
 };
-
