@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, Component } from "react";
+import { useState, useEffect, useRef, useCallback, Component, Fragment } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
 // Clerk auth — requires: npm install @clerk/clerk-react
 // If not using auth, these are unused but don't break anything
@@ -68,10 +68,12 @@ const CREDS_DEFAULTS = {
     trailingStop:    { enabled: true,  trailPercent:   "1.5", trailDelta: "absolute" }, // "absolute"=$, "percent"=%
     atrExit:         { enabled: false, atrMultiplier:  "1.5" },
     atrTpSl: {
-      enabled:     false,  // use ATR × multiplier instead of fixed % for TP/SL
-      tpMultiplier: "1.5", // TP = entry + atr × this
-      slMultiplier: "0.75",// SL = entry - atr × this  (keeps 2:1 ratio)
-      partialExit: false,  // exit 50% at 1×ATR, let rest run to full TP
+      enabled:      false,  // use ATR × multiplier instead of fixed % for TP/SL
+      tpMultiplier: "2.0",  // TP = entry + atr × this
+      slMultiplier: "1.0",  // SL = entry - atr × this  (2:1 R:R)
+      partialExit:  false,  // exit 50% at 1×ATR, let rest run to full TP
+      atrTimeframe: "15m",  // "5m" | "15m" | "1h" — ATR computed on this bar size, NOT ticks
+      minStopPct:   "0.3",  // stop distance floor as % of price — never inside the spread
     },
     trendAlignment: {
       enabled:      false, // require MTF trend confluence before BUY
@@ -101,8 +103,10 @@ const CREDS_DEFAULTS = {
   agentMode: false,
   agentIntervalSec: "15",
   rlParams: {
-    alpha: "0.1", gamma: "0.9", epsilonStart: "0.4", epsilonMin: "0.05",
-    epsilonDecay: "0.995", minEpisodes: "20", rewardScale: "100", resetOnStop: true,
+    alpha: "0.15", gamma: "0", epsilonStart: "0.15", epsilonMin: "0.03",
+    epsilonDecay: "0.98", minEpisodes: "40", rewardScale: "100",
+    buyThreshold: "0.15",   // Q (×ATR) a state must exceed to be a BUY
+    resetOnStop: false,     // keep the Q-table across stop/resume
   },
   signalSource: "rules",
   customRules: {
@@ -443,6 +447,18 @@ function calcATR(prices, period = 14) {
     return Math.abs(arr[i] - arr[i - 1]); // simplified TR (no high/low data)
   }).slice(1);
   return trueRanges.reduce((a, b) => a + b, 0) / period;
+}
+
+// Compute ATR on a real timeframe (5m/15m/1h bars from the MTF buffer), not ticks.
+// Returns { atr, source, floorApplied } — atr is the effective stop unit in $.
+// While the MTF buffer is warming up (needs 15 samples), falls back to the
+// tick-ATR but the caller should always apply the minStopPct floor.
+function calcTimeframeATR(mtf, tickPrices, timeframe = "15m", period = 14) {
+  const bars = mtf?.[timeframe]?.prices || [];
+  const tfAtr = calcATR(bars, period);
+  if (tfAtr && tfAtr > 0) return { atr: tfAtr, source: timeframe, samples: bars.length };
+  const tickAtr = calcATR(tickPrices, period) || 0;
+  return { atr: tickAtr, source: "tick(warmup)", samples: bars.length };
 }
 
 // ─── Multi-Timeframe Price Buffers ───────────────────────────────────────────
@@ -1801,8 +1817,10 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionConte
       timeExit:       { enabled: true,  maxHoldMinutes: "30"  },
       trailingStop:   { enabled: true,  trailPercent:   "1.5", trailDelta: "absolute" },
       atrExit:        { enabled: false, atrMultiplier:  "1.5" },
-      atrTpSl: creds.exitStrategies?.atrTpSl || {
-        enabled: false, tpMultiplier: "1.5", slMultiplier: "0.75", partialExit: false,
+      atrTpSl: {
+        enabled: false, tpMultiplier: "2.0", slMultiplier: "1.0", partialExit: false,
+        atrTimeframe: "15m", minStopPct: "0.3",
+        ...(creds.exitStrategies?.atrTpSl || {}),
       },
       trendAlignment: creds.exitStrategies?.trendAlignment || {
         enabled: false, requireBullish1h: true, requireBullish15m: true,
@@ -1819,15 +1837,11 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionConte
     customRules:        creds.customRules         || { enabled:false, groupLogic:"and", groups:[] },
     ruleCombiner:       creds.ruleCombiner        || { logic:"and", customThreshold:"0.3", minAgree:"3" },
     agentIntervalSec:   creds.agentIntervalSec   || "15",
-    rlParams: creds.rlParams || {
-      alpha:        "0.1",   // learning rate
-      gamma:        "0.9",   // discount factor
-      epsilonStart: "0.4",   // initial exploration rate
-      epsilonMin:   "0.05",  // minimum exploration
-      epsilonDecay: "0.995", // decay per episode
-      minEpisodes:  "20",    // warmup threshold
-      rewardScale:  "100",   // multiply netPnl by this for reward signal
-      resetOnStop:  true,    // reset Q-table when simulation stops
+    rlParams: {
+      alpha: "0.15", gamma: "0", epsilonStart: "0.15", epsilonMin: "0.03",
+      epsilonDecay: "0.98", minEpisodes: "40", rewardScale: "100",
+      buyThreshold: "0.15", resetOnStop: false,
+      ...(creds.rlParams || {}),
     },
     adaptiveSettings:   creds.adaptiveSettings   || { enabled: false, maxTpDelta: "2", maxSlDelta: "1", requireHigh: "70", applyAfter: "3" },
     tradingMode:        creds.tradingMode        || "momentum",
@@ -2471,7 +2485,7 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionConte
                   { value: "rf",       icon: "🌲", label: "Random Forest",  desc: "ML classifier on 10 indicators. Available after 15 ticks. Fast and robust." },
                   { value: "lstm",     icon: "🧠", label: "LSTM",           desc: "Sequence model predicting 5 ticks ahead. Available after 80 ticks. Better at patterns." },
                   { value: "rf+lstm",  icon: "🔬", label: "RF + LSTM",      desc: "Average both models. More conservative — needs consensus to signal." },
-                  { value: "rl",       icon: "🎮", label: "Reinforcement Learning", desc: "Q-learning agent that learns from its own trades. Improves over time. Needs 20+ trades to become reliable." },
+                  { value: "rl",       icon: "🎮", label: "Reinforcement Learning", desc: "18-state Q-table that learns which market conditions produce good entries, in ATR units. Learns from EVERY trade (rules mode too), so run rules first to train it." },
                   { value: "deepseek", icon: "🤖", label: "DeepSeek Agent", desc: "LLM reasoning over all signals. Most flexible. Requires Agent Mode ON and API key." },
                 ].map(s => (
                   <div key={s.value} onClick={() => set("signalSource", s.value)}
@@ -2495,9 +2509,10 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionConte
                 <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 12 }}>
                   <div style={{ fontSize: 10, padding: "8px 12px", borderRadius: 6,
                     background: "#6366f111", border: "0.5px solid #6366f144", color: "#4338ca" }}>
-                    Q-learning agent — learns from actual trade outcomes. Needs{" "}
-                    <strong>{form.rlParams?.minEpisodes || 20}</strong> completed trades before signals are trusted.
-                    The longer it runs, the smarter it gets. Reset Q-table when stopping if you want a fresh start.
+                    BUY-only Q-table over 18 market states (RSI × MACD × Bollinger). Each closed trade — RL's own or a
+                    rules-mode trade — updates the entry state's expected return in ATR units. Needs{" "}
+                    <strong>{form.rlParams?.minEpisodes || 40}</strong> episodes and a state needs 3+ visits before RL will
+                    exploit it. Train it in rules mode first; switch to RL once coverage is above ~60%.
                   </div>
 
                   {/* RL parameter grid */}
@@ -2509,11 +2524,11 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionConte
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
                       {[
                         { key: "alpha",        label: "Learning rate (α)", min: "0.001", max: "1",    step: "0.01",  hint: "How fast Q-values update. 0.1 = slow stable, 0.5 = fast aggressive" },
-                        { key: "gamma",        label: "Discount (γ)",      min: "0",     max: "0.999", step: "0.01",  hint: "Value of future rewards. 0.9 = cares about long-term P&L" },
-                        { key: "epsilonStart", label: "Exploration start (ε)", min: "0", max: "1",    step: "0.05",  hint: "Starting random action rate. 0.4 = 40% random at first" },
-                        { key: "epsilonMin",   label: "Exploration min",   min: "0",     max: "0.5",  step: "0.01",  hint: "Always keeps this much randomness. 0.05 = 5% forever" },
-                        { key: "epsilonDecay", label: "Decay per trade",   min: "0.9",   max: "0.999",step: "0.001", hint: "Multiplied by ε after each trade. 0.995 = slow decay" },
-                        { key: "rewardScale",  label: "Reward scale",      min: "1",     max: "10000",step: "10",    hint: "Multiply P&L for reward signal. 100 = $0.50 profit → reward 50" },
+                        { key: "buyThreshold", label: "BUY threshold (×ATR)", min: "0", max: "2",  step: "0.05",  hint: "State's expected return must exceed this to BUY. 0.15 = +0.15×ATR avg" },
+                        { key: "epsilonStart", label: "Exploration start (ε)", min: "0", max: "1",    step: "0.05",  hint: "Random BUY rate in unseen states. 0.15 = 15%. Floored by table coverage." },
+                        { key: "epsilonMin",   label: "Exploration min",   min: "0",     max: "0.5",  step: "0.01",  hint: "Floor once the table is covered. 0.03 = 3% forever" },
+                        { key: "epsilonDecay", label: "Decay per trade",   min: "0.9",   max: "0.999",step: "0.001", hint: "Multiplied by ε after each episode. 0.98 = ~35 trades to halve" },
+                        { key: "gamma",        label: "Discount (γ)",      min: "0",     max: "0.999", step: "0.01",  hint: "Keep 0 — each trade's reward is its own (bandit). Unused in v2." },
                       ].map(({ key, label, min, max, step, hint }) => (
                         <label key={key} style={{ fontSize: 11 }}>
                           <div style={{ color: "var(--color-text-secondary)", marginBottom: 4, fontWeight: 600 }}>{label}</div>
@@ -2532,7 +2547,7 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionConte
                       <label style={{ fontSize: 11 }}>
                         <div style={{ color: "var(--color-text-secondary)", marginBottom: 4, fontWeight: 600 }}>Min episodes before trusting</div>
                         <input type="number"
-                          value={form.rlParams?.minEpisodes || "20"} min="1" max="1000"
+                          value={form.rlParams?.minEpisodes || "40"} min="1" max="1000"
                           onChange={e => set("rlParams", { ...form.rlParams, minEpisodes: e.target.value })}
                           style={{ width: "100%", boxSizing: "border-box" }} />
                         <div style={{ fontSize: 9, color: "var(--color-text-tertiary)", marginTop: 2 }}>
@@ -2543,14 +2558,14 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionConte
                         <div style={{ color: "var(--color-text-secondary)", fontWeight: 600 }}>Reset Q-table on stop</div>
                         <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
                           <input type="checkbox"
-                            checked={form.rlParams?.resetOnStop !== false}
+                            checked={form.rlParams?.resetOnStop === true}
                             onChange={e => set("rlParams", { ...form.rlParams, resetOnStop: e.target.checked })} />
                           <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
-                            {form.rlParams?.resetOnStop !== false ? "Q-table resets each session" : "Q-table persists across sessions"}
+                            {form.rlParams?.resetOnStop === true ? "⚠ Q-table wiped on every stop" : "Q-table persists across stop/resume"}
                           </span>
                         </label>
                         <div style={{ fontSize: 9, color: "var(--color-text-tertiary)" }}>
-                          Uncheck to carry learned Q-values into the next simulation
+                          Leave off. Learning takes days; resetting on stop throws it away.
                         </div>
                       </label>
                     </div>
@@ -3160,10 +3175,14 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionConte
               {
                 key: "atrTpSl",
                 label: "🎯 ATR-based TP/SL (recommended)",
-                desc: "Sets TP and SL as multiples of ATR(14) — adapts to actual market volatility instead of a fixed %. Prevents overshoot: if ATR is $800, TP is $1,200 above entry (1.5×), not a fixed 2% that may never be reached.",
+                desc: "TP and SL as multiples of ATR(14) computed on real bars (default 15m), not ticks. Tick-level ATR is ~20s of noise and stops built on it get hit instantly. The min-stop floor keeps the stop outside the spread while the bar buffer warms up.",
+                extraSelect: { k: "atrTimeframe", label: "ATR timeframe",
+                  options: [["5m","5-minute bars"],["15m","15-minute bars (recommended)"],["1h","1-hour bars"]],
+                  hint: "Needs 15 bars before it's live: 5m ≈ 75 min, 15m ≈ 3h45, 1h ≈ 15h. Floor applies until then." },
                 fields: [
-                  { k: "tpMultiplier", label: "TP (ATR ×)", min: 0.5, max: 5,   step: 0.25, hint: "1.5 = TP at entry + 1.5×ATR. Keep 2:1 ratio with SL." },
-                  { k: "slMultiplier", label: "SL (ATR ×)", min: 0.1, max: 3,   step: 0.25, hint: "0.75 = SL at entry − 0.75×ATR. Maintains 2:1 R:R." },
+                  { k: "tpMultiplier", label: "TP (ATR ×)", min: 0.5, max: 5,   step: 0.25, hint: "2.0 = TP at entry + 2×ATR" },
+                  { k: "slMultiplier", label: "SL (ATR ×)", min: 0.25, max: 3, step: 0.25, hint: "1.0 = SL at entry − 1×ATR (2:1 R:R)" },
+                  { k: "minStopPct",   label: "Min stop (% of price)", min: 0.05, max: 2, step: 0.05, hint: "0.3 = stop never closer than 0.3% of price" },
                 ],
                 extraCheckbox: { k: "partialExit", label: "Partial exit: sell 50% at 1×ATR, move SL to breakeven on remainder" },
               },
@@ -3180,7 +3199,7 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionConte
                   { k: "strictMode",        label: "Strict mode: all three filters must pass (default: any 2 of 3)" },
                 ],
               },
-            ].map(({ key, label, desc, fields, extraCheckbox, extraCheckboxes }) => {
+            ].map(({ key, label, desc, fields, extraCheckbox, extraCheckboxes, extraSelect }) => {
               const s  = form.exitStrategies?.[key] || {};
               const on = !!s.enabled;
               return (
@@ -3214,6 +3233,20 @@ function SettingsModal({ creds, onSave, onClose, limits, clerkPlan, sessionConte
                           </label>
                         ))}
                       </div>
+                      {/* Dropdown (e.g. ATR timeframe) */}
+                      {extraSelect && (
+                        <label style={{ fontSize: 11 }}>
+                          <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>{extraSelect.label}</div>
+                          <select value={s[extraSelect.k] ?? extraSelect.options[0][0]}
+                            onChange={e => setExitStrategy(key, { [extraSelect.k]: e.target.value })}
+                            style={{ fontSize: 11, padding: "4px 6px", borderRadius: 4, width: "100%",
+                              border: "0.5px solid var(--color-border-secondary)",
+                              background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+                            {extraSelect.options.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                          </select>
+                          {extraSelect.hint && <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>{extraSelect.hint}</div>}
+                        </label>
+                      )}
                       {/* Single extra checkbox */}
                       {extraCheckbox && (
                         <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11, cursor: "pointer",
@@ -3731,131 +3764,173 @@ const RF_MAX_DEPTH   = 4;
 const rfPredCache    = {};
 const rfModels       = {};
 
-// ─── Reinforcement Learning (Q-Learning) ─────────────────────────────────────
-// State: discretised indicator snapshot (RSI band, MACD sign, BB zone, trend)
-// Actions: 0=HOLD, 1=BUY, 2=SELL
-// Reward: net P&L of completed trade (positive = good, negative = bad)
-// Q-table: state → [q_hold, q_buy, q_sell] — updated via Bellman equation
-const RL_ALPHA        = 0.1;   // learning rate
-const RL_GAMMA        = 0.9;   // discount factor
-const RL_EPSILON_START = 0.4;  // initial exploration rate
-const RL_EPSILON_MIN   = 0.05; // minimum exploration (always explore a little)
-const RL_EPSILON_DECAY = 0.995;// decay per episode
-const RL_MIN_EPISODES  = 20;   // minimum episodes before trusting predictions
-const RL_DIR_THRESHOLD = 0.6;  // Q-value confidence threshold for BUY/SELL
+// ─── Reinforcement Learning (Q-Learning, v2) ─────────────────────────────────
+//
+// v2 design — built for a system that completes ~10–50 trades/day, not thousands:
+//
+//   * 18 states (RSI 3 × MACD 2 × Boll 3) instead of 81. Volume dropped — least
+//     informative and it multiplied the table by 3.
+//   * BUY-only. Each state learns ONE number: expected ATR-normalised return of
+//     entering here. Exits are ATR's job; RL no longer "learns" SELL from trades
+//     it didn't choose to close.
+//   * Reward in ATR units: (exit − entry) / atrAtEntry. Position size no longer
+//     changes what the table learns. +0.8 means "entries here average +0.8×ATR".
+//   * Shadow learning: EVERY closed trade updates the table, including rules-mode
+//     trades RL didn't pick. The table trains on all your trades, not just its own.
+//   * Per-state visit counts (n) so you can read the table: a Q of +0.9 with n=2
+//     is noise; with n=15 it's a real edge. Confidence is derived from n.
+//   * Epsilon decays per EPISODE but is floored by the table's coverage — don't
+//     stop exploring while most states have never been seen.
+//
+// Q-table shape:   Map<stateId, { q: number, n: number }>
+// stateId:         3-char string "rmb"  r∈{0,1,2} RSI band, m∈{0,1} MACD sign, b∈{0,1,2} Boll zone
 
-const rlTables   = {};  // { BTC: { qTable: Map<state,float[]>, epsilon, episodes } }
-const rlPredCache = {}; // { BTC: { action, confidence, directionProbability, episodes } }
+const RL_ALPHA         = 0.15;
+const RL_GAMMA         = 0.0;     // single-step bandit: a trade's reward is its own, no bootstrap
+const RL_EPSILON_START = 0.15;
+const RL_EPSILON_MIN   = 0.03;
+const RL_EPSILON_DECAY = 0.98;
+const RL_MIN_EPISODES  = 40;
+const RL_BUY_THRESHOLD = 0.15;    // Q (×ATR) a state must exceed to be a BUY when trusted
+const RL_MIN_STATE_N   = 3;       // visits a state needs before its Q is used for BUY
 
-// Discretise continuous indicators into a compact state string
+const RL_STATE_COUNT   = 18;
+
+const rlTables    = {}; // { coin: { qTable, epsilon, episodes, entryState } }
+const rlPredCache = {}; // { coin: { action, confidence, directionProbability, ... } }
+
 function getRLState(indicators, volumeRatio) {
-  const rsi  = indicators?.rsi ?? 50;
+  const rsi  = indicators?.rsi  ?? 50;
   const macd = indicators?.macd ?? 0;
-  const boll = indicators?.boll
+  const boll = indicators?.boll && indicators.currentPrice
     ? (indicators.currentPrice - indicators.boll.lower) /
-      (indicators.boll.upper - indicators.boll.lower || 1)
+      ((indicators.boll.upper - indicators.boll.lower) || 1)
     : 0.5;
-  const vol  = volumeRatio ?? 1;
-
-  // Discretise each feature into 3–4 bins
-  const rsiBand  = rsi < 35 ? 0 : rsi > 65 ? 2 : 1;          // oversold/neutral/overbought
-  const macdSign = macd < -0.0005 ? 0 : macd > 0.0005 ? 2 : 1; // bear/flat/bull
-  const bollZone = boll < 0.2 ? 0 : boll > 0.8 ? 2 : 1;        // low/mid/high
-  const volZone  = vol < 0.8 ? 0 : vol > 1.3 ? 2 : 1;          // low/normal/high
-
-  return `${rsiBand}${macdSign}${bollZone}${volZone}`; // e.g. "0212"
+  const r = rsi  < 35 ? 0 : rsi  > 65 ? 2 : 1;
+  const m = macd < 0  ? 0 : 1;
+  const b = boll < 0.2 ? 0 : boll > 0.8 ? 2 : 1;
+  return `${r}${m}${b}`;
 }
 
-// Initialise or get Q-table entry
-function getQ(table, state) {
-  if (!table.has(state)) table.set(state, [0, 0, 0]); // [HOLD, BUY, SELL]
+// Human-readable label for a state id — used in logs and the RL panel
+function rlStateLabel(id) {
+  const [r, m, b] = id.split("").map(Number);
+  return `RSI ${["low","mid","high"][r]} · MACD ${["−","+"][m]} · BB ${["bottom","mid","top"][b]}`;
+}
+
+function newTable() { return { qTable: new Map(), epsilon: RL_EPSILON_START, episodes: 0, entryState: null }; }
+
+function getCell(table, state) {
+  if (!table.has(state)) table.set(state, { q: 0, n: 0 });
   return table.get(state);
 }
 
-// Update Q-table after trade completes (Bellman equation)
-function rlUpdate(coin, prevState, action, reward, nextState, params = {}) {
-  if (!rlTables[coin]) return;
-  const alpha        = parseFloat(params.alpha)        || RL_ALPHA;
-  const gamma        = parseFloat(params.gamma)        || RL_GAMMA;
-  const epsilonMin   = parseFloat(params.epsilonMin)   || RL_EPSILON_MIN;
-  const epsilonDecay = parseFloat(params.epsilonDecay) || RL_EPSILON_DECAY;
-
-  const { qTable } = rlTables[coin];
-  const q      = getQ(qTable, prevState);
-  const qNext  = getQ(qTable, nextState);
-  const maxQ   = Math.max(...qNext);
-  const actionIdx = action === "BUY" ? 1 : action === "SELL" ? 2 : 0;
-  // Q(s,a) ← Q(s,a) + α[r + γ·maxQ(s') - Q(s,a)]
-  q[actionIdx] = q[actionIdx] + alpha * (reward + gamma * maxQ - q[actionIdx]);
-  rlTables[coin].episodes++;
-  rlTables[coin].epsilon = Math.max(epsilonMin, rlTables[coin].epsilon * epsilonDecay);
+// Fraction of the 18 states that have been visited at least once
+function coverage(qTable) {
+  let seen = 0;
+  for (const cell of qTable.values()) if (cell.n > 0) seen++;
+  return seen / RL_STATE_COUNT;
 }
 
-// Get RL action for current state (epsilon-greedy)
-function rlPredict(coin, indicators, volumeRatio, params = {}) {
-  const epsilonStart = parseFloat(params.epsilonStart) || RL_EPSILON_START;
-  if (!rlTables[coin]) {
-    rlTables[coin] = { qTable: new Map(), epsilon: epsilonStart, episodes: 0 };
-  }
-  const { qTable, epsilon, episodes } = rlTables[coin];
+// Core update: one closed trade → one update to the ENTRY state's Q.
+// reward is in ATR units. Shadow trades (not chosen by RL) also land here.
+function rlUpdate(coin, entryState, rewardAtr, params = {}, _t = rlTables) {
+  if (!_t[coin]) _t[coin] = newTable();
+  const t     = _t[coin];
+  const alpha = parseFloat(params.alpha) || RL_ALPHA;
+  const cell  = getCell(t.qTable, entryState);
+  // Running mean with a floor on effective learning rate: early samples count more
+  const a = Math.max(alpha, 1 / (cell.n + 1));
+  cell.q = cell.q + a * (rewardAtr - cell.q);
+  cell.n += 1;
+  t.episodes += 1;
+
+  const epsMin   = parseFloat(params.epsilonMin)   || RL_EPSILON_MIN;
+  const epsDecay = parseFloat(params.epsilonDecay) || RL_EPSILON_DECAY;
+  // Decay, but keep exploring while the table is mostly unseen
+  const cov = coverage(t.qTable);
+  const covFloor = (1 - cov) * (parseFloat(params.epsilonStart) || RL_EPSILON_START);
+  t.epsilon = Math.max(epsMin, covFloor, t.epsilon * epsDecay);
+}
+
+function rlPredict(coin, indicators, volumeRatio, params = {}, _t = rlTables) {
+  if (!_t[coin]) _t[coin] = newTable();
+  const t = _t[coin];
   const state = getRLState(indicators, volumeRatio);
+  const cell  = getCell(t.qTable, state);
+  const minEp = parseInt(params.minEpisodes) || RL_MIN_EPISODES;
+  const thr   = parseFloat(params.buyThreshold) || RL_BUY_THRESHOLD;
+  const trusted = t.episodes >= minEp;
 
-  // NOTE: do NOT overwrite lastState here — it is set only at BUY time
-  // so rlReward can update the correct entry state after the trade closes.
+  // Exploit: BUY iff this state has enough visits and a positive expected ATR return.
+  // Explore: with prob ε, BUY in an under-visited state to gather data.
+  let action = "HOLD", why;
+  const explore = Math.random() < t.epsilon && cell.n < RL_MIN_STATE_N * 2;
+  if (explore) { action = "BUY"; why = "explore"; }
+  else if (cell.n >= RL_MIN_STATE_N && cell.q > thr) { action = "BUY"; why = "exploit"; }
+  else why = cell.n < RL_MIN_STATE_N ? "unseen" : "negative";
 
-  let actionIdx;
-  if (Math.random() < epsilon) {
-    actionIdx = Math.floor(Math.random() * 3);
-  } else {
-    const q = getQ(qTable, state);
-    actionIdx = q.indexOf(Math.max(...q));
-  }
-
-  const actions = ["HOLD", "BUY", "SELL"];
-  const action  = actions[actionIdx];
-
-  // Read live Q-values from the table (not a stale snapshot)
-  const q      = getQ(qTable, state);
-  const maxQ   = Math.max(...q);
-  const minQ   = Math.min(...q);
-  const range  = maxQ - minQ || 1;
-  const dirProb = (q[1] - minQ) / range;
-  const avgQ    = (q[0] + q[1] + q[2]) / 3;
-  const confidence = Math.min(99,
-    Math.round(Math.abs(maxQ - avgQ) / (Math.abs(maxQ) + 0.001) * 100));
+  // Confidence grows with visits and with |q| relative to threshold; capped 95
+  const nConf = Math.min(1, cell.n / 10);
+  const qConf = Math.min(1, Math.max(0, cell.q) / (thr * 3));
+  const confidence = Math.round(Math.min(95, 100 * nConf * (0.4 + 0.6 * qConf)));
+  // directionProbability: logistic on q so the vol-gate (which expects 0..1) still works
+  const directionProbability = 1 / (1 + Math.exp(-2.5 * cell.q));
 
   rlPredCache[coin] = {
-    action, confidence, directionProbability: dirProb,
-    episodes, epsilon: epsilon.toFixed(3), state,
-    // Live Q-values — read directly from Map so they reflect latest updates
-    get qValues() {
-      const qLive = getQ(rlTables[coin]?.qTable, this.state);
-      return qLive.map(v => v.toFixed(4));
-    },
+    action, why, confidence, directionProbability,
+    episodes: t.episodes, epsilon: t.epsilon.toFixed(3),
+    state, stateLabel: rlStateLabel(state),
+    q: cell.q, n: cell.n,
+    coverage: coverage(t.qTable),
+    trusted,
+    // Compatibility with older UI that reads qValues[1] as "BUY value"
+    qValues: ["0.0000", cell.q.toFixed(4), "0.0000"],
   };
   return rlPredCache[coin];
 }
 
-// Called when a BUY is placed — records the entry state
-// so rlReward can update the correct Q(entry_state, BUY) after the trade closes
-function rlOnBuy(coin, indicators, volumeRatio) {
-  if (!rlTables[coin]) {
-    rlTables[coin] = { qTable: new Map(), epsilon: RL_EPSILON_START, episodes: 0 };
-  }
-  // Snapshot the entry state at BUY time — NOT overwritten during the hold
-  rlTables[coin].entryState  = getRLState(indicators, volumeRatio);
-  rlTables[coin].entryAction = "BUY";
+// Call on every BUY (RL-chosen or not). Stores the entry state so the reward
+// lands on the right cell. atrAtEntry lets reward be computed in ATR units.
+function rlOnBuy(coin, indicators, volumeRatio, _t = rlTables, atrAtEntry = null, chosenByRL = false) {
+  if (!_t[coin]) _t[coin] = newTable();
+  _t[coin].entryState  = getRLState(indicators, volumeRatio);
+  _t[coin].entryAtr    = atrAtEntry;
+  _t[coin].entryShadow = !chosenByRL;
 }
 
-// Called after a trade closes — reward the BUY action taken at entry
-function rlReward(coin, netPnl, indicators, volumeRatio, params = {}) {
-  if (!rlTables[coin]) return;
-  const rewardScale = parseFloat(params.rewardScale) || 100;
-  const entryState  = rlTables[coin].entryState || "1111";
-  const nextState   = getRLState(indicators, volumeRatio);
-  const reward      = netPnl * rewardScale;
-  rlUpdate(coin, entryState, "BUY",  reward, nextState, params);
-  rlUpdate(coin, nextState,  "SELL", reward, nextState, params);
+// Call on every SELL. rewardAtr = (exit − entry) / atrAtEntry. Pass netPnl and
+// position for the fallback when atrAtEntry is unknown.
+function rlReward(coin, netPnl, indicators, volumeRatio, params = {}, _t = rlTables, ctx = {}) {
+  if (!_t[coin]) return;
+  const t = _t[coin];
+  if (!t.entryState) return;
+  const atr = ctx.atrAtEntry || t.entryAtr;
+  let rewardAtr;
+  if (atr && ctx.entryPrice && ctx.exitPrice) {
+    rewardAtr = (ctx.exitPrice - ctx.entryPrice) / atr;
+  } else {
+    // fallback: dollar P&L scaled — still works, just position-size dependent
+    rewardAtr = netPnl * ((parseFloat(params.rewardScale) || 100) / 10000);
+  }
+  rlUpdate(coin, t.entryState, rewardAtr, params, _t);
+  const result = { state: t.entryState, label: rlStateLabel(t.entryState), rewardAtr,
+                   shadow: !!t.entryShadow, q: getCell(t.qTable, t.entryState).q,
+                   n: getCell(t.qTable, t.entryState).n, episodes: t.episodes };
+  t.entryState = null; t.entryAtr = null; t.entryShadow = false;
+  return result;
+}
+
+// Snapshot of the whole table, sorted by q, for the RL panel / logs
+function rlTableSummary(coin, _t = rlTables) {
+  const t = _t[coin];
+  if (!t) return null;
+  const rows = [];
+  for (const [id, cell] of t.qTable.entries()) {
+    if (cell.n > 0) rows.push({ state: id, label: rlStateLabel(id), q: cell.q, n: cell.n });
+  }
+  rows.sort((a, b) => b.q - a.q);
+  return { coin, episodes: t.episodes, epsilon: t.epsilon, coverage: coverage(t.qTable), rows };
 }
 
 // Extract feature snapshot from current indicator state
@@ -4523,6 +4598,10 @@ function CryptoAlgoTrader() {
     return { ...CREDS_DEFAULTS };
   });
 
+  // credsRef: lets []-dep callbacks (applyPrices) read current creds without a stale closure
+  const credsRef = useRef(creds);
+  useEffect(() => { credsRef.current = creds; }, [creds]);
+
   // Save creds to localStorage whenever they change
   useEffect(() => {
     try {
@@ -4556,6 +4635,9 @@ function CryptoAlgoTrader() {
   const agentDecisionRef   = useRef(null);
   const [txLog, setTxLog]       = useState([]);
   const sessionBalanceRef          = useRef(null);
+  // Tracks which session ID we last restored creds from — prevents overwriting
+  // user edits on every 3-second poll
+  const lastRestoredSessionRef     = useRef(null);
   // Tracks the balance at the moment the CURRENT run began (fresh start or resume)
   // so "from start" reflects change since this run, not since the session's genesis.
   const sessionStartBalanceRef     = useRef(null);
@@ -4578,6 +4660,9 @@ function CryptoAlgoTrader() {
   const [paperInlineName,   setPaperInlineName]   = useState("");
   const serverSession = serverSessions.find(s => (s.sessionId || s.session_id) === activeSessionId) || null;
 
+  // The session the user is currently LOOKING AT — either the one they clicked 👁 on,
+  // or the active session, or the first running simulation session as last resort.
+  // ALL balance/P&L/trade displays should use this, never a bare .find(s => s.running).
   // ── Paper session persistence (optional, requires login + Supabase) ─────────
   const [paperSessions,        setPaperSessions]        = useState([]);
   const [paperSaving,          setPaperSaving]          = useState(false);
@@ -4587,6 +4672,15 @@ function CryptoAlgoTrader() {
   const autoSaveIntervalRef    = useRef(null);
   // Session viewer — shows a saved session in read-only mode without resuming it
   const [viewingSession, setViewingSession] = useState(null); // { name, snapshot } | null
+
+  // The session currently being viewed — used by all balance/P&L/log displays.
+  // Priority: clicked session (👁) > active session > first running session.
+  // Declared here so it's always after viewingSession and serverSession.
+  // Only resolves when the user has explicitly selected a session (via 👁 or start).
+  // No fallback to "first running session" — the landing page must stay neutral.
+  const currentViewedSession = activeSessionId
+    ? serverSessions.find(s => s.sessionId === activeSessionId) || null
+    : null;
   // Drawer visibility is SEPARATE from viewing state — closing the drawer
   // should not exit "viewing" mode and revert the dashboard to live data.
   // Only the context bar's × (or Resume/Stop) exits viewing mode.
@@ -4666,7 +4760,9 @@ function CryptoAlgoTrader() {
     SOL: { prices: [COIN_BASE.SOL], volumes: [1], history: [], pnl: 0, position: null, trades: 0, mtf: initMTFBuffers() },
   });
   // Latest live prices — written by WebSocket (primary) or 5s HTTP poller (fallback)
-  const livePriceRef = useRef({});
+  const livePriceRef     = useRef({});
+  const priceHistoryRef     = useRef({}); // accumulates prices for chart even without browser loop
+  const fetchViaBridgeRef   = useRef(null); // set after fetchViaBridge is declared — for visibilitychange
 
   // WebSocket price handler — writes directly to livePriceRef (same as HTTP poller)
   const handleWsPrice = useCallback((coin, price, bid, ask) => {
@@ -4775,6 +4871,7 @@ function CryptoAlgoTrader() {
           // Normalise all snake_case DB fields to camelCase
           sessionId:       s.sessionId       || s.session_id,
           name:            s.name            || s.session_name,
+          exchange:        s.credsSnapshot?.provider || s.creds_snapshot?.provider || s.exchange || "coinbase",
           coinBalances:    s.coinBalances    || s.coin_balances    || {},
           pnl:             s.pnl             || s.pnl_by_coin      || {},
           unrealized:      s.unrealized      || s.unrealized_by_coin || {},
@@ -4795,19 +4892,12 @@ function CryptoAlgoTrader() {
       if ((runningSession || hasResumable) && !runningRef.current && !autoEnabledRef.current) {
         setShowResumeBar(true);
       }
-      // Auto-select first running session if none selected
-      if (runningSession && !activeSessionIdRef.current) {
-        setActiveSessionId(runningSession.sessionId);
-      }
-      // Restore creds from the active running session so the dashboard
-      // reflects the settings that session is actually using
-      if (runningSession?.credsSnapshot && Object.keys(runningSession.credsSnapshot).length > 0) {
-        setCreds(prev => ({
-          ...prev,
-          ...runningSession.credsSnapshot,
-          keys: prev.keys,  // always keep local keys
-        }));
-      }
+      // NO auto-select. Sessions are selected only when the user clicks one
+      // in Manage Sessions (👁) or starts a new one. The landing page stays neutral.
+      // DO NOT restore session creds into browser state on poll.
+      // Each VPS session carries its own credsSnapshot — the dashboard reads
+      // it directly from currentViewedSession.credsSnapshot for display.
+      // Browser creds are only for creating new sessions and live trading.
 
       // Sync logs + balance from active session
       const curActiveId = activeSessionIdRef.current;
@@ -4849,6 +4939,23 @@ function CryptoAlgoTrader() {
     return () => clearInterval(serverPollRef.current);
   }, [clerkLoaded, fetchServerSessions]); // restart when Clerk becomes ready
 
+  // Re-fetch immediately when the tab becomes visible again.
+  // Browsers throttle/pause setInterval in background tabs (Chrome: 1/min,
+  // Safari: fully paused) so the poll misses many ticks while hidden.
+  // The VPS server keeps trading — this just catches the dashboard up instantly.
+  useEffect(() => {
+    if (!TRADING_SERVER) return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        fetchServerSessions();
+        // fetchViaBridge is declared later — call via ref to avoid issues
+        fetchViaBridgeRef.current?.(false);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [fetchServerSessions]);
+
   // Create a new VPS session
   const startServerSession = useCallback(async (name, mode, coinAllocations) => {
     if (!TRADING_SERVER) return false;
@@ -4884,6 +4991,24 @@ function CryptoAlgoTrader() {
       addAutoLog(`Stop failed: ${e.message}`, "error");
     }
   }, [serverFetch, addAutoLog, fetchServerSessions]);
+
+  // Permanently delete a session (stop + remove from DB)
+  const deleteServerSession = useCallback(async (sessionId, name) => {
+    if (!TRADING_SERVER || !sessionId) return;
+    if (!window.confirm(`Delete "${name || sessionId}"?
+
+This permanently removes all session data including trades, P&L history and settings. This cannot be undone.`)) return;
+    try {
+      const res = await serverFetch(`/sessions/${sessionId}`, { method: "DELETE" });
+      if (!res?.ok) throw new Error("Delete failed");
+      addAutoLog(`🗑 Session "${name}" deleted`, "warn");
+      if (sessionId === activeSessionIdRef.current) setActiveSessionId(null);
+      if (viewingSession?.sessionId === sessionId) setViewingSession(null);
+      fetchServerSessions();
+    } catch (e) {
+      addAutoLog(`Delete failed: ${e.message}`, "error");
+    }
+  }, [serverFetch, addAutoLog, fetchServerSessions, viewingSession]);
 
   // Resume a stopped session from DB
   const resumeServerSession = useCallback(async (sessionId) => {
@@ -4958,24 +5083,17 @@ function CryptoAlgoTrader() {
   // Safe RL serialization — sanitises Infinity/NaN which break JSON.stringify
   function serializeRLForSave() {
     try {
-      const sanitize = (v) => {
-        if (typeof v !== "number") return v;
-        if (!isFinite(v) || isNaN(v)) return 0;
-        return parseFloat(v.toFixed(6)); // trim floating point noise
-      };
       const out = {};
       for (const coin of (creds.enabledCoins || ["BTC"])) {
         const t = rlTables[coin];
         if (!t) continue;
         const qTableObj = {};
-        (t.qTable || new Map()).forEach((vals, state) => {
-          qTableObj[state] = (vals || [0,0,0]).map(sanitize);
+        (t.qTable || new Map()).forEach((cell, state) => {
+          qTableObj[state] = { q: isFinite(cell.q) ? +cell.q.toFixed(6) : 0, n: cell.n || 0 };
         });
-        out[coin] = {
-          epsilon:  sanitize(t.epsilon  ?? 0.4),
-          episodes: t.episodes || 0,
-          qTable:   qTableObj,
-        };
+        out[coin] = { v: 2, epsilon: t.epsilon, episodes: t.episodes,
+          entryState: t.entryState || null, entryAtr: t.entryAtr || null, entryShadow: !!t.entryShadow,
+          qTable: qTableObj };
       }
       return out;
     } catch (_) { return {}; }
@@ -5027,8 +5145,7 @@ function CryptoAlgoTrader() {
     const snap = session.snapshot || session;
     if (!snap.creds) return;
 
-    // Restore settings
-    setCreds(snap.creds);
+    // Session runs with its own creds on the server — don't overwrite browser creds
 
     // Restore balance
     const bal = snap.sessionBalance || 50;
@@ -5038,17 +5155,8 @@ function CryptoAlgoTrader() {
     // reflects change since THIS resume, not since the session began originally
     sessionStartBalanceRef.current = bal;
 
-    // Restore settings (creds) from the snapshot so the session runs with
-    // the exact same signal config, exit rules, indicators etc. that were
-    // active when it was last saved. Merge over current creds so API keys
-    // (which are never stored in snapshots) are preserved from the browser.
-    if (snap.creds && Object.keys(snap.creds).length > 0) {
-      setCreds(prev => ({
-        ...prev,          // keep API keys and any fields not in snapshot
-        ...snap.creds,    // restore signal config, exit rules, coins, etc.
-        keys: prev.keys,  // always keep current keys — never overwrite from snapshot
-      }));
-    }
+    // Session runs with its own credsSnapshot on the server.
+    // We do NOT overwrite browser creds — each session is independent.
 
     // Restore P&L, positions, trades in stateRef
     for (const coin of (snap.enabledCoins || ["BTC"])) {
@@ -5061,10 +5169,11 @@ function CryptoAlgoTrader() {
     // Restore RL Q-tables
     if (snap.rlTables) {
       for (const [coin, t] of Object.entries(snap.rlTables)) {
+        if (t.v !== 2) { rlTables[coin] = newTable(); continue; } // v1 tables can't be mapped to v2
         rlTables[coin] = {
-          epsilon:  t.epsilon  ?? 0.4,
-          episodes: t.episodes ?? 0,
-          qTable:   new Map(Object.entries(t.qTable || {})),
+          epsilon: t.epsilon ?? RL_EPSILON_START, episodes: t.episodes ?? 0,
+          entryState: t.entryState || null, entryAtr: t.entryAtr || null, entryShadow: !!t.entryShadow,
+          qTable: new Map(Object.entries(t.qTable || {}).map(([k, v]) => [k, { q: v.q || 0, n: v.n || 0 }])),
         };
       }
     }
@@ -5182,19 +5291,10 @@ function CryptoAlgoTrader() {
     } catch (_) {}
   }, [fetchPaperSessions]);
 
-  // Push settings to active running session when creds change
-  useEffect(() => {
-    if (!TRADING_SERVER || !activeSessionId || serverStatus !== "running") return;
-    const timer = setTimeout(async () => {
-      try {
-        await serverFetch(`/sessions/${activeSessionId}`, {
-          method: "PUT",
-          body:   JSON.stringify({ creds }),
-        });
-      } catch (_) {}
-    }, 2000);
-    return () => clearTimeout(timer);
-  }, [creds, activeSessionId, serverStatus, serverFetch]);
+  // REMOVED: auto-push of browser creds to active session on every creds change.
+  // This was overwriting each session's own settings with browser defaults.
+  // Session settings are now saved ONLY via the Settings modal onSave handler,
+  // which explicitly targets the viewed session via PUT /sessions/:id.
 
   // ── Simulation settings save / load ──────────────────────────────────────────
   // Declared here (after addAutoLog) to avoid forward reference error
@@ -5364,6 +5464,36 @@ function CryptoAlgoTrader() {
         }
         // Seed livePriceRef so runTick immediately uses real prices
         livePriceRef.current[coin] = { price: prices[coin], bid: prices[coin], ask: prices[coin] };
+
+        // When browser loop is NOT running (VPS session mode), still accumulate
+        // price history so the chart has real data to render.
+        // When browser loop IS running, runTick handles this — skip to avoid double push.
+        if (!runningRef.current) {
+          s[coin].prices.push(prices[coin]);
+          if (s[coin].prices.length > 200) s[coin].prices.shift();
+          // Compute indicators from the accumulated price buffer so SMA/BB lines render
+          const boll = calcBollinger(s[coin].prices, 20);
+          // keep MTF buffers fed so timeframe-ATR works while viewing a VPS session
+          if (s[coin].mtf) updateMTFBuffers(s[coin].mtf, prices[coin]);
+          const atrCfgV = credsRef.current?.exitStrategies?.atrTpSl || {};
+          const atrTfV = atrCfgV.atrTimeframe || "15m";
+          const atrInfoV = calcTimeframeATR(s[coin].mtf, s[coin].prices, atrTfV, 14);
+          const floorV = prices[coin] * ((parseFloat(atrCfgV.minStopPct) || 0.3) / 100);
+          const atrV = Math.max(atrInfoV.atr || 0, floorV);
+          s[coin]._atrInfo = { ...atrInfoV, effective: atrV, floorApplied: (atrInfoV.atr || 0) < floorV };
+          s[coin].history.push({
+            t: Date.now(), price: prices[coin],
+            atr: atrV, atrSource: atrInfoV.source,
+            sma20:  calcSMA(s[coin].prices, 20),
+            sma50:  calcSMA(s[coin].prices, 50),
+            bUpper: boll?.upper ?? null,
+            bLower: boll?.lower ?? null,
+            rsi:    calcRSI(s[coin].prices, 14),
+            action: "HOLD", confidence: 0, score: 0,
+            pnl: s[coin].pnl, exitTrigger: null,
+          });
+          if (s[coin].history.length > 120) s[coin].history.shift();
+        }
       }
     }
     if (anyOk) setSnapshot(JSON.parse(JSON.stringify(s)));
@@ -5373,6 +5503,7 @@ function CryptoAlgoTrader() {
       lastAttempt: fmtDateTime(new Date()),
     });
   }, []);
+  fetchViaBridgeRef.current = fetchViaBridge; // wire ref for visibilitychange handler
 
   // ── Listen for postMessage responses from the bridge script ──────────────────
   useEffect(() => {
@@ -5710,18 +5841,26 @@ function CryptoAlgoTrader() {
   // Live + WS off/failed       → 5s HTTP fallback
   // Simulate + WS off/failed   → 15s HTTP anchor
   // Stopped                    → no polling
+  // Price polling: runs when the browser loop is active OR when viewing a VPS session
+  // (VPS sessions need live prices for charts even though the browser loop isn't running)
+  // Price polling runs when the SELECTED session is running (not just any session).
+  // Without a selected session, the landing page stays neutral — no prices, no charts.
+  const serverSessionActive = !!activeSessionId
+    && serverSessions.some(s => s.sessionId === activeSessionId && s.running);
+  // Use the SELECTED session's provider for price fetching.
+  // activeSessionId is set when the user clicks a session — that's the one we follow.
+  const activePriceProvider = serverSessions.find(s => s.sessionId === activeSessionId)?.credsSnapshot?.provider
+    || creds.provider;
   useEffect(() => {
-    if (!running) return; // stopped — no polling at all
+    const needPrices = running || serverSessionActive;
+    if (!needPrices) return;
     if (wsStatus === "connected") return; // WS active — no HTTP needed
-    if (autoEnabled) {
-      // Live mode, WS not connected — 5s HTTP fallback
-      const id = setInterval(() => fetchViaBridge(true, creds.provider), 5_000);
-      return () => clearInterval(id);
-    }
-    // Simulation mode, WS not connected — 15s HTTP anchor
-    const id = setInterval(() => fetchViaBridge(true, creds.provider), 15_000);
+    // Fetch immediately so chart shows on first open
+    fetchViaBridge(false, activePriceProvider);
+    // Then poll on interval
+    const id = setInterval(() => fetchViaBridge(true, activePriceProvider), 5_000);
     return () => clearInterval(id);
-  }, [autoEnabled, running, wsStatus, fetchViaBridge, creds.provider]);
+  }, [autoEnabled, running, serverSessionActive, wsStatus, fetchViaBridge, activePriceProvider]);
 
   // ── Fetch Coinbase balances (single /accounts call) ───────────────────────
   const fetchBalances = useCallback(async () => {
@@ -6066,17 +6205,39 @@ function CryptoAlgoTrader() {
 
   // ── Manual trade execution ────────────────────────────────────────────────
   const executeManualTrade = useCallback(async (coin, action) => {
-    const price = stateRef.current[coin].prices.at(-1);
-    if (!price) return;
+    const price = stateRef.current[coin]?.prices.at(-1);
+    if (!price) { addAutoLog(`[MANUAL] No live price for ${coin}`, "warn"); return; }
     setManualConfirm(null);
     action === "BUY" ? setManualBuying(true) : setManualSelling(true);
 
+    // ── VPS simulation session: send command to server ────────────────────────
+    const vpsSession = currentViewedSession?.mode === "simulation" ? currentViewedSession : null;
+    if (vpsSession && !autoEnabled) {
+      try {
+        const res  = await serverFetch(`/sessions/${vpsSession.sessionId}/trade`, {
+          method: "POST",
+          body:   JSON.stringify({ action, coin }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          addAutoLog(`[MANUAL] ${action} ${coin} rejected: ${data.error}`, "warn");
+        } else {
+          addAutoLog(`[MANUAL] ${action} ${coin} sent to server @ $${price.toFixed(2)}`, "info");
+          // Refresh sessions so position/balance update immediately
+          setTimeout(fetchServerSessions, 1000);
+        }
+      } catch (e) {
+        addAutoLog(`[MANUAL] ${action} ${coin} failed: ${e.message}`, "error");
+      }
+      action === "BUY" ? setManualBuying(false) : setManualSelling(false);
+      return;
+    }
+
+    // ── Browser simulation loop ───────────────────────────────────────────────
     const s = stateRef.current[coin];
-    // Use compounding session balance for live trades too
     const tradeUSD = sessionBalanceRef.current || parseFloat(creds.tradeSizeUSD) || 50;
     const baseSize = tradeUSD / price;
 
-    // Update local position state
     if (action === "BUY" && !s.position) {
       s.position = { price, size: roundLotSize(parseFloat(creds.tradeSizeUSD) / price, coin), entryTick: tickRef.current, manual: true, algoOwned: true };
       s.trades++;
@@ -6090,17 +6251,14 @@ function CryptoAlgoTrader() {
       addAutoLog(`[MANUAL] SELL ${coin} @ $${price.toFixed(2)} → ${profit >= 0 ? "+" : ""}$${Math.abs(profit).toFixed(2)} (${profitPct >= 0 ? "+" : ""}${profitPct.toFixed(2)}%)`, profit >= 0 ? "success" : "warn");
     } else if (action === "SELL" && !s.position) {
       addAutoLog(`[MANUAL] SELL ignored — no open position for ${coin}`, "warn");
-      setManualSelling(false);
-      return;
+      setManualSelling(false); return;
     } else if (action === "BUY" && s.position) {
       addAutoLog(`[MANUAL] BUY ignored — position already open for ${coin}`, "warn");
-      setManualBuying(false);
-      return;
+      setManualBuying(false); return;
     }
-
     setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
 
-    // Place real order if automation is live (goes through proxy)
+    // ── Live trading: place real order ────────────────────────────────────────
     if (autoEnabled && !creds.sandbox) {
       try {
         const keys = creds.keys?.[creds.provider] || {};
@@ -6119,9 +6277,8 @@ function CryptoAlgoTrader() {
     } else if (creds.sandbox) {
       addAutoLog(`[MANUAL SANDBOX] ${action} ${coin} @ $${price.toFixed(2)}`, "sandbox");
     }
-
     action === "BUY" ? setManualBuying(false) : setManualSelling(false);
-  }, [creds, autoEnabled, addAutoLog]);
+  }, [creds, autoEnabled, addAutoLog, serverSessions, serverFetch, fetchServerSessions]);
 
   // ── Sync algo state from exchange (positions + fills) ────────────────────
   const [exchangeState, setExchangeState] = useState(null); // { positions, fills, syncedAt }
@@ -6215,7 +6372,7 @@ function CryptoAlgoTrader() {
     sessionBalanceRef.current = null;
     setSessionBalance(null);
     // Reset RL Q-tables if configured
-    if (creds.rlParams?.resetOnStop !== false) {
+    if (creds.rlParams?.resetOnStop === true) {
       COINS.forEach(c => { if (rlTables[c]) delete rlTables[c]; });
       Object.keys(rlPredCache).forEach(c => delete rlPredCache[c]);
       addAutoLog("🎮 RL Q-tables reset", "info");
@@ -6381,8 +6538,8 @@ function CryptoAlgoTrader() {
       const rlSignal = (src === "rl") && rlCache && rlCache.episodes >= rlMinEp ? {
         action:         rlCache.action,
         confidence:     String(rlCache.confidence),
-        score:          rlCache.action === "BUY" ? "2" : rlCache.action === "SELL" ? "-2" : "0",
-        reasons:        [{ label: `RL Q[H:${rlCache.qValues?.[0]} B:${rlCache.qValues?.[1]} S:${rlCache.qValues?.[2]}] ε=${rlCache.epsilon} ep=${rlCache.episodes}`, vote: rlCache.action === "BUY" ? 1 : -1 }],
+        score:          rlCache.action === "BUY" ? "2" : "0",
+        reasons:        [{ label: `RL ${rlCache.why} [${rlCache.state}] q=${(rlCache.q ?? 0).toFixed(2)}×ATR n=${rlCache.n ?? 0} ε=${rlCache.epsilon} ep=${rlCache.episodes}`, vote: rlCache.action === "BUY" ? 1 : 0 }],
         agreeingCount:  1, totalIndicators: 1, fromRL: true,
       } : null;
 
@@ -6494,8 +6651,23 @@ function CryptoAlgoTrader() {
           : direction === "up" ? entryPrice + scaledV : entryPrice - scaledV;
       };
 
-      // ATR — needed by both the trend/ATR block below and later gate checks
-      const atr = calcATR(cs.prices, 14);
+      // ATR — computed on real timeframe bars (default 15m), NOT the tick buffer.
+      // Tick-level ATR is ~21s of bid-ask noise; stops built on it get hit instantly.
+      const atrTpSlCfgEarly = creds.exitStrategies?.atrTpSl;
+      const atrTf   = atrTpSlCfgEarly?.atrTimeframe || "15m";
+      const atrInfo = calcTimeframeATR(cs.mtf, cs.prices, atrTf, 14);
+      // Floor: stop distance is never less than minStopPct of price, so the stop
+      // is never inside the spread — matters most while the MTF buffer warms up.
+      const minStopDist = newPrice * ((parseFloat(atrTpSlCfgEarly?.minStopPct) || 0.3) / 100);
+      const atr = Math.max(atrInfo.atr || 0, minStopDist);
+      cs._atrInfo = { ...atrInfo, effective: atr, floorApplied: (atrInfo.atr || 0) < minStopDist };
+
+      // Track max favorable / adverse excursion on the open position (in $ from entry)
+      if (cs.position?.price) {
+        const excursion = newPrice - cs.position.price;
+        if (excursion > (cs.position.maxFav || 0)) cs.position.maxFav = excursion;
+        if (excursion < -(cs.position.maxAdv || 0)) cs.position.maxAdv = -excursion;
+      }
 
       // ── Trend alignment gate ─────────────────────────────────────────────────
       // Checks MTF confluence: only allow BUY when the higher timeframes agree
@@ -6536,15 +6708,17 @@ function CryptoAlgoTrader() {
       // Replaces fixed-% TP/SL with ATR × multiplier targets.
       // Computed at BUY time and stored in cs.position so they don't drift.
       const atrTpSlCfg = creds.exitStrategies?.atrTpSl;
-      const atrTpPrice = atrTpSlCfg?.enabled && atr && cs.position
-        ? cs.position.price + atr * (parseFloat(atrTpSlCfg.tpMultiplier) || 1.5)
+      // Freeze ATR at entry so TP/SL levels don't drift while the trade is open
+      const atrRef = cs.position?.atrAtEntry || atr;
+      const atrTpPrice = atrTpSlCfg?.enabled && atrRef && cs.position
+        ? cs.position.price + atrRef * (parseFloat(atrTpSlCfg.tpMultiplier) || 2.0)
         : null;
-      const atrSlPrice = atrTpSlCfg?.enabled && atr && cs.position
-        ? cs.position.price - atr * (parseFloat(atrTpSlCfg.slMultiplier) || 0.75)
+      const atrSlPrice = atrTpSlCfg?.enabled && atrRef && cs.position
+        ? cs.position.price - atrRef * (parseFloat(atrTpSlCfg.slMultiplier) || 1.0)
         : null;
       // Partial exit: has the 1×ATR level been hit yet?
-      const atrPartialHit = atrTpSlCfg?.enabled && atrTpSlCfg?.partialExit && atr && cs.position
-        ? newPrice >= cs.position.price + atr * 1.0
+      const atrPartialHit = atrTpSlCfg?.enabled && atrTpSlCfg?.partialExit && atrRef && cs.position
+        ? newPrice >= cs.position.price + atrRef * 1.0
         : false;
 
       // ── 1. Standard TP / SL ───────────────────────────────────────────────────
@@ -6715,7 +6889,13 @@ function CryptoAlgoTrader() {
       const noPending  = !pendingRef.current[coin]; // no order already in flight
       // Cooling off: block BUY for 1 minute after a confirmed SELL
       const lastSell   = cooldownRef.current[coin];
-      const cooldownMs = (parseFloat(creds.cooldownMinutes) || 1) * 60_000;
+      // Cooldown: at least the configured minutes, and never less than one ATR bar
+      // when ATR exits are on — re-entering 60s after a 15m-ATR stop-out just
+      // re-enters the same move that stopped you out.
+      const cfgCooldownMs = (parseFloat(creds.cooldownMinutes) || 1) * 60_000;
+      const atrBarMs      = creds.exitStrategies?.atrTpSl?.enabled
+        ? (MTF_INTERVALS[creds.exitStrategies.atrTpSl.atrTimeframe || "15m"] || 0) : 0;
+      const cooldownMs = Math.max(cfgCooldownMs, atrBarMs);
       const inCooldown = lastSell !== null && (Date.now() - lastSell) < cooldownMs;
       // ── Volume gate ────────────────────────────────────────────────────────────
       const esV = creds.exitStrategies?.volumeGate;
@@ -6824,7 +7004,7 @@ function CryptoAlgoTrader() {
 
           // RL parameters
           if (rlC) {
-            addAutoLog(`  🎮 RL: action=${rlC.action} Q=[H:${rlC.qValues?.[0]} B:${rlC.qValues?.[1]} S:${rlC.qValues?.[2]}] ε=${rlC.epsilon} ep=${rlC.episodes}${rlC.episodes < RL_MIN_EPISODES ? " ⚠ exploring" : ""}`, "info");
+            addAutoLog(`  🎮 RL: ${rlC.action} (${rlC.why}) [${rlC.state}] ${rlC.stateLabel} · q=${(rlC.q ?? 0).toFixed(2)}×ATR n=${rlC.n ?? 0} · ε=${rlC.epsilon} ep=${rlC.episodes} cov=${Math.round((rlC.coverage||0)*100)}%${!rlC.trusted ? " ⚠ untrusted" : ""}`, "info");
           }
 
           // Custom rules that fired
@@ -6864,8 +7044,8 @@ function CryptoAlgoTrader() {
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
                 const buyFees = filledQty * entryPrice * (parseFloat(creds.feePercent || 0) / 100);
-                // Record RL entry state at live BUY confirmation
-                try { rlOnBuy(coin, indicators, volumeRatio); } catch(_) {}
+                // Record RL entry state at live BUY confirmation (shadow-learns rules trades too)
+                try { rlOnBuy(coin, indicators, volumeRatio, rlTables, atr, !!signal.fromRL); } catch(_) {}
                 logTransaction("BUY", coin, entryPrice, filledQty, null, buyFees, null,
                   agentDecisionRef.current?.[coin]?.reasoning, lstmPredCache[coin]);
                 if (dxLabel) addAutoLog(`📊 [DYNAMIC] ${coin} exits scaled: ${dxLabel}`, "info");
@@ -6927,10 +7107,11 @@ function CryptoAlgoTrader() {
           // SIMULATION only — use compounding sessionBalance, not fixed tradeSizeUSD
           const simTradeUSD = sessionBalanceRef.current || parseFloat(creds.tradeSizeUSD) || 50;
           const simSize = simTradeUSD / newPrice;
-          cs.position = { price: newPrice, size: simSize, entryTick: tickRef.current, sim: true, algoOwned: true };
+          cs.position = { price: newPrice, size: simSize, entryTick: tickRef.current, sim: true, algoOwned: true,
+            atrAtEntry: atr, maxFav: 0, maxAdv: 0, openedAt: Date.now() };
           cs.trades++;
           // Record RL entry state at BUY time
-          try { rlOnBuy(coin, indicators, volumeRatio); } catch(_) {}
+          try { rlOnBuy(coin, indicators, volumeRatio, rlTables, atr, !!signal.fromRL); } catch(_) {}
           const simFees = simSize * newPrice * (parseFloat(creds.feePercent || 0) / 100);
           addAutoLog(`🛒 SIM BUY ${coin} — using balance $${simTradeUSD.toFixed(2)}`, "info");
           logTransaction("BUY", coin, newPrice, simSize, null, simFees, null,
@@ -6991,8 +7172,12 @@ function CryptoAlgoTrader() {
               setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
               cooldownRef.current[coin] = Date.now();
               addAutoLog(`${coin} cooling off - next BUY in ${creds.cooldownMinutes || 1} min`, "info");
-              // Reward RL agent
-              try { rlReward(coin, profit - feeCost, indicators, volumeRatio, creds.rlParams); } catch (_) {}
+              // Reward RL agent (ATR-unit reward; every trade is an episode)
+              try {
+                const rl = rlReward(coin, profit - feeCost, indicators, volumeRatio, creds.rlParams, rlTables,
+                  { entryPrice: posAtSell.price, exitPrice: actualSellPrice, atrAtEntry: posAtSell.atrAtEntry });
+                if (rl) addAutoLog(`🎮 RL ${rl.shadow ? "shadow" : "own"} ep=${rl.episodes}: [${rl.state}] ${rl.label} → ${rl.rewardAtr >= 0 ? "+" : ""}${rl.rewardAtr.toFixed(2)}×ATR · Q=${rl.q.toFixed(2)} n=${rl.n}`, "info");
+              } catch (_) {}
               // Update compounding session balance
               if (sessionBalanceRef.current !== null) {
                 const newBal = Math.max(1, sessionBalanceRef.current + profit - feeCost);
@@ -7016,11 +7201,23 @@ function CryptoAlgoTrader() {
           const profit    = calcProfit(simPos.price, newPrice, simPos.size, creds.feePercent);
           const simFees   = simPos.size * (newPrice + simPos.price) * (parseFloat(creds.feePercent || 0) / 100);
           cs.pnl += profit;
+          // MAE/MFE in ATR units — the numbers that tell you whether TP/SL are placed right.
+          // MFE ≫ TP mult → TP too far. MAE ≈ SL mult on losers → SL inside noise.
+          {
+            const a = simPos.atrAtEntry || atr || 1;
+            const mfe = (simPos.maxFav || 0) / a, mae = (simPos.maxAdv || 0) / a;
+            const held = simPos.openedAt ? Math.round((Date.now() - simPos.openedAt) / 60000) : null;
+            addAutoLog(`📏 ${coin} ${sellReason}: MFE +${mfe.toFixed(2)}×ATR · MAE −${mae.toFixed(2)}×ATR${held != null ? ` · held ${held}m` : ""} · ATR $${a.toFixed(2)} (${cs._atrInfo?.source || "?"})`, profit >= 0 ? "success" : "warn");
+          }
           cs.position = null;
           cs.trades++;
           cooldownRef.current[coin] = Date.now();
-          // Reward RL agent with trade outcome
-          try { rlReward(coin, profit - simFees, indicators, volumeRatio, creds.rlParams); } catch (_) {}
+          // Reward RL agent (ATR-unit reward; every trade is an episode)
+          try {
+            const rl = rlReward(coin, profit - simFees, indicators, volumeRatio, creds.rlParams, rlTables,
+              { entryPrice: simPos.price, exitPrice: newPrice, atrAtEntry: simPos.atrAtEntry });
+            if (rl) addAutoLog(`🎮 RL ${rl.shadow ? "shadow" : "own"} ep=${rl.episodes}: [${rl.state}] ${rl.label} → ${rl.rewardAtr >= 0 ? "+" : ""}${rl.rewardAtr.toFixed(2)}×ATR · Q=${rl.q.toFixed(2)} n=${rl.n}`, "info");
+          } catch (_) {}
           // Update compounding session balance
           if (sessionBalanceRef.current !== null) {
             const newBal = Math.max(1, sessionBalanceRef.current + profit);
@@ -7041,6 +7238,7 @@ function CryptoAlgoTrader() {
       const rlSnap    = rlPredCache[coin];
       cs.history.push({
         t: tickRef.current, price: newPrice,
+        atr: atr, atrSource: cs._atrInfo?.source,
         sma20: indicators.sma20, sma50: indicators.sma50,
         bUpper: indicators.boll?.upper, bLower: indicators.boll?.lower,
         rsi: indicators.rsi, action: signal.action,
@@ -7106,27 +7304,40 @@ function CryptoAlgoTrader() {
   // - viewing a stopped paper/live session (historical)
   // - viewing a running VPS session (live data from poll)
   // Does NOT overlay when the browser's own paper trading loop is running
-  const isViewing = !!viewingSession && (!running || viewingSession.isRunning);
+  // isViewing: a VPS session is selected. Uses live running state from the poll,
+  // not the frozen snapshot from click time.
+  const isViewing = !!viewingSession && !!currentViewedSession;
 
   // ── Session view data ──────────────────────────────────────────────────────
   // When viewing a session, build proper coin-like objects for all dashboard cards.
   // For running VPS sessions merge latest poll data. For paper sessions use snapshot.
-  const viewedSessionData = isViewing && viewSnap ? (() => {
-    // For running VPS sessions get latest polled snapshot
-    const liveS = viewingSession.isRunning
-      ? serverSessions.find(s => (s.sessionId || s.session_id) === viewingSession.sessionId)
-      : null;
+  const viewedSessionData = isViewing ? (() => {
+    // Always get the latest polled data from serverSessions for running sessions.
+    // For stopped sessions, fall back to the snapshot captured at click time.
+    // This ensures balance/trades/P&L are always current, not stale.
+    const liveS = serverSessions.find(
+      s => (s.sessionId || s.session_id) === viewingSession.sessionId
+    );
+    // Use liveS as the primary source — it has the freshest data from the 3s poll.
+    // Fall back to viewSnap only for fields the server doesn't return.
+    const snap = viewSnap || {};
 
     const eff = {
-      pnlByCoin:    (liveS?.pnl || liveS?.pnl_by_coin || viewSnap.pnlByCoin || {}),
-      positions:    (liveS?.positions || viewSnap.positions || {}),
-      tradesByCoin: (liveS?.tradesByCoin || liveS?.trades_by_coin || viewSnap.tradesByCoin || {}),
-      coinBalances: (liveS?.coinBalances || liveS?.coin_balances || viewSnap.coinBalances || {}),
+      pnlByCoin:    (liveS?.pnl || snap.pnlByCoin || {}),
+      positions:    (liveS?.positions || snap.positions || {}),
+      tradesByCoin: (liveS?.tradesByCoin || snap.tradesByCoin || {}),
+      coinBalances: (liveS?.coinBalances || snap.coinBalances || {}),
       livePrices:   (liveS?.livePrices || {}),
-      sessionCreds: (viewSnap.creds || {}),
-      enabledCoins: (viewSnap.enabledCoins || liveS?.coins || Object.keys(viewSnap.pnlByCoin || {}) || ["BTC"]),
-      sessionBalance: parseFloat(liveS?.sessionBalance || liveS?.session_balance || viewSnap.sessionBalance || 0),
-      totalTrades:  parseInt(liveS?.totalTrades || liveS?.total_trades || viewSnap.totalTrades || 0),
+      sessionCreds: (liveS?.credsSnapshot || snap.creds || {}),
+      enabledCoins: (liveS?.coins || snap.enabledCoins
+        || (viewingSession?.snapshot?.enabledCoins)
+        || Object.keys(snap.pnlByCoin || {})
+        || ["BTC"]),
+      // Compute total balance from coinBalances.current fields
+      sessionBalance: liveS?.coinBalances
+        ? Object.values(liveS.coinBalances).reduce((a, b) => a + (parseFloat(b.current) || 0), 0)
+        : parseFloat(snap.sessionBalance || 0),
+      totalTrades: parseInt(liveS?.totalTrades || snap.totalTrades || 0),
     };
 
     // Build per-coin display objects matching the shape that dashboard cards expect
@@ -7147,10 +7358,15 @@ function CryptoAlgoTrader() {
       // Each coin's own starting allocation — falls back to session default only if not set
       const allocated = cb ? parseFloat(cb.allocated || 0) : parseFloat(eff.sessionCreds?.tradeSizeUSD || 50);
 
+      // Use the real accumulated prices/history from stateRef so charts show
+      // real price lines and computed indicators (SMA, BB, RSI).
+      // stateRef is kept current by applyPrices even when browser loop is off.
+      const realCoinState = stateRef.current[c];
       coinData[c] = {
-        prices:   livePrice ? [livePrice, livePrice] : [0, 0],
-        volumes:  [1],
-        history:  [{ i: 0, pnl, rsi: null, price: livePrice || null, sma20: null, sma50: null, bUpper: null, bLower: null }],
+        _atrInfo: realCoinState?._atrInfo || null,
+        prices:   realCoinState?.prices?.length > 1 ? realCoinState.prices : (livePrice ? [livePrice] : [0]),
+        volumes:  realCoinState?.volumes || [1],
+        history:  realCoinState?.history?.length > 0 ? realCoinState.history : [{ i: 0, pnl, rsi: null, price: livePrice || null, sma20: null, sma50: null, bUpper: null, bLower: null }],
         pnl,
         trades,
         position,
@@ -7173,23 +7389,21 @@ function CryptoAlgoTrader() {
   const coin        = viewedCoin || snapshot[effectiveCoin] || snapshot[selectedCoin];
   const lastH       = coin.history[coin.history.length - 1];
 
-  const currentPrice = viewedCoin
-    ? (coin.prices[0] || 0)
-    : coin.prices[coin.prices.length - 1];
-  const priceChange = !viewedCoin && coin.prices.length > 1
+  const currentPrice = coin.prices[coin.prices.length - 1] || 0;
+  const priceChange = coin.prices.length > 1
     ? ((currentPrice - coin.prices[coin.prices.length - 2]) / coin.prices[coin.prices.length - 2]) * 100
     : 0;
 
-  const unrealizedDollar = viewedCoin
-    ? (viewedCoin.unrealizedDollar || 0)
-    : (coin.position
-        ? calcProfit(coin.position.price, currentPrice, coin.position.size || 0, creds.feePercent)
-        : 0);
-  const unrealized = viewedCoin
-    ? (viewedCoin.unrealized || 0)
-    : (coin.position && coin.position.price && coin.position.size
-        ? (unrealizedDollar / (coin.position.price * coin.position.size)) * 100
-        : 0);
+  // For VPS sessions: compute unrealized from live price + position from server.
+  // viewedCoin.unrealizedDollar may be 0 if server hasn't computed it yet —
+  // fall back to computing it from currentPrice (which is the live price from applyPrices).
+  const unrealizedDollar = coin.position
+    ? calcProfit(coin.position.price, currentPrice, coin.position.size || 0,
+        creds.feePercent)
+    : 0;
+  const unrealized = coin.position && coin.position.price && coin.position.size
+    ? (unrealizedDollar / (coin.position.price * coin.position.size)) * 100
+    : 0;
 
   const chartData = coin.history.slice(-60).map((h, i) => ({
     i, price: h.price ? +h.price.toFixed(2) : null,
@@ -7215,10 +7429,14 @@ function CryptoAlgoTrader() {
   const coinInSession = runningCoins.includes(effectiveCoin);
 
   // When viewing a session use its creds for display (provider, settings labels etc)
-  const displayCreds  = isViewing && viewedSessionData?.eff.sessionCreds
-    && Object.keys(viewedSessionData.eff.sessionCreds).length > 0
-    ? viewedSessionData.eff.sessionCreds
-    : creds;
+  // Session settings: read directly from the session's own credsSnapshot.
+  // NEVER written back to browser creds or localStorage — each session is independent.
+  // Falls back to browser creds only when no session is being viewed.
+  const sessionCreds  = currentViewedSession?.credsSnapshot
+    && Object.keys(currentViewedSession.credsSnapshot).length > 0
+    ? { ...CREDS_DEFAULTS, ...currentViewedSession.credsSnapshot }
+    : null;
+  const displayCreds  = sessionCreds || creds;
   // Coins to display — viewed session's coins or browser creds coins
   const DISPLAY_COINS = isViewing && viewedCoins.length > 0 ? viewedCoins : COINS;
 
@@ -7577,6 +7795,13 @@ function CryptoAlgoTrader() {
                           const data = await res.json();
                           if (!res.ok) { setNewSessionError(data.error || "Failed to start"); return; }
                           setActiveSessionId(data.sessionId);
+                          // Also enter viewing mode so the dashboard shows this session immediately
+                          setViewingSession({
+                            name: data.name, sessionId: data.sessionId,
+                            isLive: false, isRunning: true, savedAt: null,
+                            snapshot: { enabledCoins: creds.enabledCoins || ["BTC"], creds },
+                          });
+                          setShowViewerDrawer(true);
                           setNewSessionName("");
                           addAutoLog(`🧪 Test session "${data.name}" started on server — runs 24/7`, "success");
                           fetchServerSessions();
@@ -7677,8 +7902,10 @@ function CryptoAlgoTrader() {
                       <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
                         <button onClick={e => {
                             e.stopPropagation();
+                            setActiveSessionId(sid);   // this session is now THE selected session
                             setViewingSession({
-                              name, sessionId: sid, isLive: true,
+                              name, sessionId: sid,
+                              isLive: s.mode === "live",   // false for simulation
                               isRunning: s.running, savedAt: s.updated_at,
                               snapshot: {
                                 sessionBalance: bal, pnlByCoin: s.pnl || s.pnl_by_coin || {},
@@ -7715,15 +7942,24 @@ function CryptoAlgoTrader() {
                             ⏹ Stop
                           </button>
                         )}
+                        <button
+                          onClick={e => { e.stopPropagation(); deleteServerSession(sid, name); }}
+                          title="Permanently delete this session and all its data"
+                          style={{ padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                            background: "#ef444411", color: "#ef444488",
+                            border: "0.5px solid #ef444433",
+                            cursor: "pointer", fontFamily: "inherit" }}>
+                          🗑
+                        </button>
                       </div>
                     </div>
                     <div style={{ padding: "0 14px 10px",
                       display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
                       {[
                         { label: "Balance", val: `$${bal.toFixed(2)}`, color: "var(--color-text-primary)" },
-                        { label: "Realized P&L", val: `${totalPnl>=0?"+":""}$${totalPnl.toFixed(2)}`,
+                        { label: "Realized P&L", val: `${totalPnl < 0 ? "-" : "+"}$${Math.abs(totalPnl).toFixed(2)}`,
                           color: totalPnl >= 0 ? "#10b981" : "#ef4444" },
-                        { label: "Unrealized", val: `${totalUnrealized>=0?"+":""}$${totalUnrealized.toFixed(2)}`,
+                        { label: "Unrealized", val: `${totalUnrealized < 0 ? "-" : "+"}$${Math.abs(totalUnrealized).toFixed(2)}`,
                           color: totalUnrealized >= 0 ? "#10b981" : "#f59e0b" },
                         { label: "Trades", val: trades, color: "var(--color-text-primary)" },
                       ].map(stat => (
@@ -7997,7 +8233,7 @@ function CryptoAlgoTrader() {
                             {name}
                           </div>
                           <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 1 }}>
-                            {s.mode === "live" ? "⚡ Live" : "🧪 Paper"} · {s.exchange || "binance"}
+                            {s.mode === "live" ? "⚡ Live" : "🧪 Test"} · {s.credsSnapshot?.provider || s.creds_snapshot?.provider || s.exchange || "—"}
                             {" · "}{(s.coins||[]).join(", ")}
                           </div>
                         </div>
@@ -8042,6 +8278,15 @@ function CryptoAlgoTrader() {
                                 fontFamily: "inherit" }}>
                               ▶ Resume
                             </button>
+                            <button
+                              onClick={e => { e.stopPropagation(); deleteServerSession(sid, name); }}
+                              title="Permanently delete this session"
+                              style={{ padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                                background: "#ef444411", color: "#ef444488",
+                                border: "0.5px solid #ef444433",
+                                cursor: "pointer", fontFamily: "inherit" }}>
+                              🗑
+                            </button>
                           </>
                         )}
                         {s.running && (
@@ -8085,6 +8330,15 @@ function CryptoAlgoTrader() {
                                 color: "#ef4444", border: "0.5px solid #ef444444",
                                 cursor: "pointer", fontFamily: "inherit" }}>
                               ⏹ Stop
+                            </button>
+                            <button
+                              onClick={e => { e.stopPropagation(); deleteServerSession(sid, name); }}
+                              title="Stop and permanently delete this session"
+                              style={{ padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                                background: "#ef444411", color: "#ef444488",
+                                border: "0.5px solid #ef444433",
+                                cursor: "pointer", fontFamily: "inherit" }}>
+                              🗑
                             </button>
                           </>
                         )}
@@ -8203,7 +8457,9 @@ function CryptoAlgoTrader() {
                 <span style={{ width: 7, height: 7, borderRadius: "50%",
                   background: "#10b981", boxShadow: "0 0 0 3px #10b98133",
                   display: "inline-block", flexShrink: 0 }} />
-                <span style={{ fontSize: 12, color: "#10b981", fontWeight: 600 }}>Live</span>
+                <span style={{ fontSize: 12, color: "#10b981", fontWeight: 600 }}>
+                  {viewingSession.isLive ? "Live" : "Running"}
+                </span>
               </div>
             ) : (
               <span style={{ fontSize: 12, color: "rgba(255,255,255,0.5)" }}>Viewing</span>
@@ -8272,7 +8528,7 @@ function CryptoAlgoTrader() {
               </>
             )}
             {viewingSession.isLive && !viewingSession.isRunning && (
-              <button onClick={() => { resumeServerSession(viewingSession.sessionId); setViewingSession(null); }}
+              <button onClick={() => { resumeServerSession(viewingSession.sessionId); }}
                 style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11, fontWeight: 700,
                   background: "#10b981", color: "#fff", border: "none",
                   cursor: "pointer", fontFamily: "inherit" }}>
@@ -8280,7 +8536,7 @@ function CryptoAlgoTrader() {
               </button>
             )}
             {viewingSession.isRunning && (
-              <button onClick={() => { stopServerSession(viewingSession.sessionId); setViewingSession(null); }}
+              <button onClick={() => { stopServerSession(viewingSession.sessionId); }}
                 style={{ padding: "4px 12px", borderRadius: 6, fontSize: 11, fontWeight: 700,
                   background: "#ef444422", color: "#ef4444",
                   border: "0.5px solid #ef444444",
@@ -8298,8 +8554,8 @@ function CryptoAlgoTrader() {
                 Details
               </button>
             )}
-            <button onClick={() => setViewingSession(null)}
-              title="Exit session view — return to live dashboard"
+            <button onClick={() => { setViewingSession(null); setActiveSessionId(null); }}
+              title="Exit session view — return to neutral dashboard"
               style={{ background: "none", border: "none", color: "rgba(255,255,255,0.5)",
                 fontSize: 18, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>
               ×
@@ -8310,15 +8566,28 @@ function CryptoAlgoTrader() {
 
       {/* ── Session Viewer Panel ──────────────────────────────────────────────── */}
       {viewingSession && showViewerDrawer && (() => {
-        const snap = viewingSession.snapshot || {};
-        const bal  = parseFloat(snap.sessionBalance || 0);
-        const coins = snap.enabledCoins || [];
-        const pnlByCoin = snap.pnlByCoin || snap.pnl_by_coin || {};
+        // Always prefer live polled data over the stale snapshot captured at click time
+        const liveS  = serverSessions.find(s =>
+          (s.sessionId || s.session_id) === viewingSession.sessionId);
+        const snap   = viewingSession.snapshot || {};
+        // Use liveS for all stats so the drawer stays current
+        const coins   = liveS?.coins || snap.enabledCoins || [];
+        const pnlByCoin = liveS?.pnl || snap.pnlByCoin || snap.pnl_by_coin || {};
         const totalPnl  = Object.values(pnlByCoin).reduce((a,b) => a+(parseFloat(b)||0), 0);
-        const trades    = snap.totalTrades || 0;
-        const logs      = snap.logs || [];
-        const rlState   = snap.rlTables || {};
-        const coinBals  = snap.coinBalances || snap.coin_balances || {};
+        const trades    = liveS?.totalTrades || snap.totalTrades || 0;
+        const logs      = liveS?.logs || snap.logs || [];
+        // RL table: live server summary (VPS session) → rows keyed by coin with {episodes,epsilon,coverage,rows[]};
+        // or the saved browser Q-table (legacy paper session). Normalise both to the {qTable:{id:{q,n}}} shape.
+        const liveRl = liveS?.rlTable || {};
+        const rlState = Object.keys(liveRl).length
+          ? Object.fromEntries(Object.entries(liveRl).filter(([,v]) => v).map(([coin, v]) => [coin, {
+              v: 2, episodes: v.episodes, epsilon: v.epsilon,
+              qTable: Object.fromEntries((v.rows || []).map(r => [r.state, { q: r.q, n: r.n }])),
+            }]))
+          : (snap.rlTables || {});
+        const coinBals  = liveS?.coinBalances || snap.coinBalances || snap.coin_balances || {};
+        const bal = Object.values(coinBals).reduce((a, b) => a + (parseFloat(b.current) || 0), 0)
+          || parseFloat(snap.sessionBalance || 0);
 
         return (
           <>
@@ -8376,19 +8645,46 @@ function CryptoAlgoTrader() {
                       <div key={coin} style={{ padding:"8px 12px", borderRadius:7, marginBottom:6,
                         background:"var(--color-background-secondary)",
                         border:"0.5px solid #6366f122" }}>
-                        <div style={{ display:"flex", justifyContent:"space-between",
-                          fontSize:11, marginBottom:4 }}>
-                          <span style={{ fontWeight:700, color:COIN_COLORS[coin]||"#6366f1" }}>{coin}</span>
-                          <span style={{ color:"var(--color-text-tertiary)" }}>
-                            {t.episodes || 0} episodes · ε={parseFloat(t.epsilon||0.4).toFixed(3)}
-                          </span>
-                        </div>
-                        <div style={{ fontSize:10, color:"var(--color-text-tertiary)" }}>
-                          {Object.keys(t.qTable||{}).length} states learned
-                          {t.episodes >= 20
-                            ? " · ✓ trained"
-                            : ` · needs ${20-(t.episodes||0)} more episodes`}
-                        </div>
+                        {(() => {
+                          const minEp = parseInt(snap.creds?.rlParams?.minEpisodes) || 40;
+                          const thr   = parseFloat(snap.creds?.rlParams?.buyThreshold) || 0.15;
+                          const cells = Object.entries(t.qTable || {})
+                            .map(([id, v]) => ({ id, q: v?.q ?? 0, n: v?.n ?? 0 }))
+                            .filter(x => x.n > 0).sort((a, b) => b.q - a.q);
+                          const cov = Math.round(cells.length / 18 * 100);
+                          const trusted = (t.episodes || 0) >= minEp;
+                          const fmtQ = q => `${q >= 0 ? "+" : ""}${q.toFixed(2)}`;
+                          return (
+                            <>
+                              <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
+                                <span style={{ fontWeight:700, color:COIN_COLORS[coin]||"#6366f1" }}>{coin}</span>
+                                <span style={{ color:"var(--color-text-tertiary)" }}>
+                                  {t.episodes || 0} ep · ε={parseFloat(t.epsilon||0.15).toFixed(3)} · {cov}% of 18 states
+                                </span>
+                              </div>
+                              <div style={{ fontSize:10, color: trusted ? "#10b981" : "var(--color-text-tertiary)", marginBottom: cells.length ? 6 : 0 }}>
+                                {trusted ? "✓ trusted" : `⏳ ${minEp - (t.episodes||0)} more episodes to trust`}
+                                {t.v !== 2 && t.episodes > 0 && <span style={{ color: "#f59e0b" }}> · v1 table — will reset on next run</span>}
+                              </div>
+                              {cells.length > 0 && (
+                                <div style={{ display:"grid", gridTemplateColumns:"auto 1fr auto auto", gap:"2px 8px", fontSize:10, fontFamily:"monospace" }}>
+                                  {cells.map(x => {
+                                    const usable = x.n >= 3 && x.q > thr;
+                                    const col = usable ? "#10b981" : x.q < 0 && x.n >= 3 ? "#ef4444" : "var(--color-text-tertiary)";
+                                    return (
+                                      <Fragment key={x.id}>
+                                        <span style={{ color: col, fontWeight: 700 }}>{x.id}</span>
+                                        <span style={{ color:"var(--color-text-secondary)", fontFamily:"inherit" }}>{rlStateLabel(x.id)}</span>
+                                        <span style={{ color: col, textAlign:"right" }}>{fmtQ(x.q)}×ATR</span>
+                                        <span style={{ color:"var(--color-text-tertiary)", textAlign:"right" }}>n={x.n}</span>
+                                      </Fragment>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </>
+                          );
+                        })()}
                       </div>
                     ))}
                   </div>
@@ -8407,7 +8703,7 @@ function CryptoAlgoTrader() {
                       <div>Signal: <strong style={{ color:"var(--color-text-primary)" }}>{snap.signalSource || snap.creds?.signalSource || "rules"}</strong></div>
                       <div>Coins: <strong style={{ color:"var(--color-text-primary)" }}>{coins.join(", ") || "—"}</strong></div>
                       <div>Starting balance: <strong style={{ color:"var(--color-text-primary)" }}>${parseFloat(snap.creds?.tradeSizeUSD||50).toFixed(2)}</strong></div>
-                      <div>Exchange: <strong style={{ color:"var(--color-text-primary)" }}>{snap.creds?.provider || "binance"}</strong></div>
+                      <div>Exchange: <strong style={{ color:"var(--color-text-primary)" }}>{displayCreds.provider || "—"}</strong></div>
                       {snap.creds?.tickIntervalMs && (
                         <div>Tick interval: <strong style={{ color:"var(--color-text-primary)" }}>
                           {snap.creds.tickIntervalMs >= 60000
@@ -8453,13 +8749,12 @@ function CryptoAlgoTrader() {
       })()}
 
       {showSettings && (() => {
-        // When viewing a session, edit THAT session's settings, not the browser defaults
-        const viewedSnap     = viewingSession?.snapshot;
-        const sessionCreds   = viewedSnap?.creds && Object.keys(viewedSnap.creds).length > 0
-          ? viewedSnap.creds
-          : null;
-        const editingSession = !!sessionCreds && !!viewingSession;
-        const modalCreds     = editingSession ? sessionCreds : creds;
+        // When viewing a VPS session, the modal shows and edits THAT session's settings.
+        // currentViewedSession.credsSnapshot is always the live server-side value.
+        const editingSession = !!currentViewedSession && !!viewingSession;
+        const modalCreds     = editingSession
+          ? ({ ...CREDS_DEFAULTS, ...currentViewedSession.credsSnapshot })
+          : creds;
 
         return (
           <SettingsModal
@@ -8475,40 +8770,31 @@ function CryptoAlgoTrader() {
             onSave={async (f) => {
               setShowSettings(false);
 
-              // Always update browser creds AND localStorage immediately,
-              // regardless of whether we're editing a session or not.
-              // This ensures settings survive tab close in all cases.
-              if (!editingSession) {
-                setCreds(f);
-                // Belt-and-suspenders: write directly in addition to the useEffect
+              if (editingSession && viewingSession?.sessionId) {
+                // ── VPS session settings ────────────────────────────────────
+                // Save to server + Supabase only. Do NOT touch browser creds.
+                // Each session is independent — browser settings are for new sessions only.
                 try {
-                  const { keys, ...safe } = f;
-                  localStorage.setItem("automation_trader_creds", JSON.stringify(safe));
-                } catch (_) {}
-                addAutoLog("⚙️ Settings saved", "info");
-              } else if (viewingSession.isRunning && viewingSession.sessionId) {
-                // Also push to the running server session
-                try {
-                  await serverFetch(`/sessions/${viewingSession.sessionId}`, {
+                  const res = await serverFetch(`/sessions/${viewingSession.sessionId}`, {
                     method: "PUT",
                     body:   JSON.stringify({ creds: f }),
                   });
-                  addAutoLog(`⚙️ Settings updated on session "${viewingSession.name}"`, "success");
-                  setViewingSession(prev => prev ? ({
-                    ...prev,
-                    snapshot: { ...prev.snapshot, creds: f },
-                  }) : null);
-                  fetchServerSessions();
+                  if (!res?.ok) throw new Error(`HTTP ${res?.status}`);
+                  addAutoLog(`⚙️ Settings saved to "${viewingSession.name}"`, "success");
+                  // Force next poll to pick up the new credsSnapshot from server
+                  setTimeout(fetchServerSessions, 500);
                 } catch (e) {
-                  addAutoLog(`Settings push failed: ${e.message}`, "error");
+                  addAutoLog(`⚙️ Session settings save failed: ${e.message}`, "error");
                 }
               } else {
-                // Stopped session — update the snapshot in memory
-                addAutoLog(`⚙️ Session settings updated (resume to apply)`, "info");
-                setViewingSession(prev => prev ? ({
-                  ...prev,
-                  snapshot: { ...prev.snapshot, creds: f },
-                }) : null);
+                // ── Browser / new-session settings ─────────────────────────
+                // Save to browser state + localStorage only.
+                setCreds(f);
+                try {
+                  const { keys, ...safe } = f;
+                  localStorage.setItem(CREDS_STORAGE_KEY, JSON.stringify(safe));
+                } catch (_) {}
+                addAutoLog("⚙️ Settings saved", "info");
               }
             }}
             onClose={() => { setShowSettings(false); if (tourActive) setTourForcedTab(null); }}
@@ -8643,22 +8929,27 @@ function CryptoAlgoTrader() {
 
           {cbError && <span style={{ fontSize: 11, color: "#ef4444", flex: 1 }}><i className="ti ti-alert-circle" aria-hidden="true" /> {cbError}</span>}
         {/* Session balance display */}
-        {(running && sessionBalance !== null || (isViewing && viewedSessionData)) && (
+        {(running && sessionBalance !== null || (isViewing && viewedSessionData)
+           || serverSessions.some(s => s.running)) && (
           <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
             <span style={{ color: "var(--color-text-tertiary)" }}>
               {isViewing ? "Session balance:" : "Trading balance:"}
             </span>
             {(() => {
-              const bal = isViewing
-                ? (viewedCoin?.balance || viewedSessionData?.eff.sessionBalance || 0)
-                : (sessionBalance || 0);
-              // For live (non-viewing) sessions, "start" is the balance at the
-              // moment THIS run began — fresh start or resume — not the session's
-              // original genesis balance. This makes "from start" mean "this run".
-              // For viewed sessions, use the coin's own starting allocation.
-              const start = isViewing
-                ? (viewedCoin?.allocated != null ? viewedCoin.allocated : parseFloat(displayCreds.tradeSizeUSD || 50))
-                : (sessionStartBalanceRef.current != null ? sessionStartBalanceRef.current : parseFloat(displayCreds.tradeSizeUSD || 50));
+              // Always prefer live server data for VPS sessions.
+              // Use currentViewedSession so we show the RIGHT session's balance,
+              // not just whichever session happens to be running.
+              const vpsCb = currentViewedSession?.coinBalances?.[effectiveCoin];
+              const bal   = vpsCb
+                ? parseFloat(vpsCb.current || 0)
+                : isViewing
+                  ? (viewedCoin?.balance || viewedSessionData?.eff.sessionBalance || 0)
+                  : (sessionBalance || 0);
+              const start = vpsCb
+                ? parseFloat(vpsCb.allocated || parseFloat(displayCreds.tradeSizeUSD || 50))
+                : isViewing
+                  ? (viewedCoin?.allocated != null ? viewedCoin.allocated : parseFloat(displayCreds.tradeSizeUSD || 50))
+                  : (sessionStartBalanceRef.current != null ? sessionStartBalanceRef.current : parseFloat(displayCreds.tradeSizeUSD || 50));
               const diff  = bal - start;
               return (
                 <>
@@ -9063,12 +9354,41 @@ function CryptoAlgoTrader() {
             <span style={{ fontSize: 20, fontWeight: 700 }}>${fmt(currentPrice, selectedCoin === "BTC" ? 0 : 2)}</span>
             <span style={{ fontWeight: 600, color: priceChange >= 0 ? "#10b981" : "#ef4444" }}>{fmtPct(priceChange)}</span>
           </div>
-          <div style={{ display: "flex", gap: 12, fontSize: 10, color: "var(--color-text-secondary)" }}>
+          <div style={{ display: "flex", gap: 12, fontSize: 10, color: "var(--color-text-secondary)", alignItems: "center", flexWrap: "wrap" }}>
             {[["Price", COIN_COLORS[selectedCoin]], ["SMA20", "#f59e0b"], ["SMA50", "#6366f1"], ["BB", "#94a3b8"]].map(([l, c]) => (
               <span key={l} style={{ display: "flex", alignItems: "center", gap: 4 }}>
                 <span style={{ width: 16, height: 2, background: c, display: "inline-block" }} />{l}
               </span>
             ))}
+            {(() => {
+              // ATR readout — the effective stop unit, its source bar size, and % of price
+              const ai   = coin._atrInfo || stateRef.current[effectiveCoin]?._atrInfo;
+              const atrV = ai?.effective ?? lastH?.atr;
+              if (!atrV || !currentPrice) return null;
+              const pct  = (atrV / currentPrice * 100).toFixed(2);
+              const warm = ai?.source?.startsWith("tick") || ai?.floorApplied;
+              return (
+                <span title={warm
+                    ? `ATR bar buffer warming up (${ai?.samples ?? 0}/15 ${displayCreds.exitStrategies?.atrTpSl?.atrTimeframe || "15m"} bars) — floor of ${displayCreds.exitStrategies?.atrTpSl?.minStopPct || 0.3}% applied`
+                    : `ATR(14) on ${ai?.source} bars`}
+                  style={{ marginLeft: "auto", padding: "2px 7px", borderRadius: 4, fontWeight: 600,
+                    background: warm ? "#f59e0b18" : "#6366f118",
+                    color: warm ? "#b45309" : "#6366f1", border: `0.5px solid ${warm ? "#f59e0b44" : "#6366f144"}` }}>
+                  ATR ${atrV.toFixed(effectiveCoin === "BTC" ? 0 : 2)} · {pct}%
+                  {" "}<span style={{ opacity: 0.7 }}>{warm ? "⏳ " + (ai?.source || "warmup") : ai?.source}</span>
+                </span>
+              );
+            })()}
+            {coin.position && displayCreds.exitStrategies?.atrTpSl?.enabled && (
+              <>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ width: 16, height: 0, borderTop: "2px dashed #10b981", display: "inline-block" }} />TP
+                </span>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ width: 16, height: 0, borderTop: "2px dashed #ef4444", display: "inline-block" }} />SL
+                </span>
+              </>
+            )}
           </div>
         </div>
         <ResponsiveContainer width="100%" height={200}>
@@ -9081,6 +9401,27 @@ function CryptoAlgoTrader() {
             <Line type="monotone" dataKey="sma50" stroke="#6366f1" strokeWidth={1.2} dot={false} strokeDasharray="3 3" />
             <Line type="monotone" dataKey="sma20" stroke="#f59e0b" strokeWidth={1.2} dot={false} strokeDasharray="4 2" />
             <Line type="monotone" dataKey="price" stroke={COIN_COLORS[selectedCoin]} strokeWidth={1.8} dot={false} />
+            {(() => {
+              // Draw entry / TP / SL levels so you can see where the exits sit vs. the noise
+              const pos = coin.position;
+              const cfg = displayCreds.exitStrategies?.atrTpSl;
+              if (!pos?.price || !cfg?.enabled) return null;
+              const a   = pos.atrAtEntry || coin._atrInfo?.effective || lastH?.atr;
+              if (!a) return null;
+              const tp  = pos.price + a * (parseFloat(cfg.tpMultiplier) || 2);
+              const sl  = pos._partialSl || (pos.price - a * (parseFloat(cfg.slMultiplier) || 1));
+              const d   = effectiveCoin === "BTC" ? 0 : 2;
+              return (
+                <>
+                  <ReferenceLine y={pos.price} stroke="#94a3b8" strokeWidth={1}
+                    label={{ value: `entry $${pos.price.toFixed(d)}`, position: "insideTopRight", fontSize: 9, fill: "#94a3b8" }} />
+                  <ReferenceLine y={tp} stroke="#10b981" strokeDasharray="4 3" strokeWidth={1.2}
+                    label={{ value: `TP $${tp.toFixed(d)}`, position: "insideTopRight", fontSize: 9, fill: "#10b981" }} />
+                  <ReferenceLine y={sl} stroke="#ef4444" strokeDasharray="4 3" strokeWidth={1.2}
+                    label={{ value: `${pos._partialSl ? "BE" : "SL"} $${sl.toFixed(d)}`, position: "insideBottomRight", fontSize: 9, fill: "#ef4444" }} />
+                </>
+              );
+            })()}
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -9116,19 +9457,49 @@ function CryptoAlgoTrader() {
               <Line type="monotone" dataKey="pnl" stroke={coin.pnl >= 0 ? "#10b981" : "#ef4444"} strokeWidth={1.5} dot={false} />
             </LineChart>
           </ResponsiveContainer>
-          <div style={{ fontSize: 11, marginTop: 4, color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
-            {!coinInSession && running ? (
-              <span style={{ color: "var(--color-text-tertiary)" }}>{effectiveCoin} not in session</span>
-            ) : coin.position && coin.trades === 0 ? (
-              // Open position, no closed trades yet — the number shown is purely unrealized
-              <>
-                {"$"}{(coin.pnl + unrealizedDollar).toFixed(2)}
-                <span style={{ color: "var(--color-text-tertiary)" }}> (unrealized · position still open, 0 closed)</span>
-              </>
-            ) : (
-              `$${(coin.pnl + unrealizedDollar).toFixed(2)} — ${coin.trades} trade${coin.trades !== 1 ? "s" : ""}`
-            )}
-          </div>
+          {(() => {
+            if (!coinInSession && running) {
+              return <div style={{ fontSize: 11, marginTop: 4, color: "var(--color-text-tertiary)" }}>
+                {effectiveCoin} not in session
+              </div>;
+            }
+            // For VPS sessions: net P&L = balance change (cb.current - cb.allocated)
+            // This is the same number shown in the balance card "from start".
+            // For browser sessions: use realized + unrealized as before.
+            const cb = currentViewedSession?.coinBalances?.[effectiveCoin]
+              || viewedSessionData?.eff?.coinBalances?.[effectiveCoin];
+            const netPnl      = cb
+              ? parseFloat(cb.current || 0) - parseFloat(cb.allocated || 0)
+              : coin.pnl + unrealizedDollar;
+            const color       = netPnl >= 0 ? "#10b981" : "#ef4444";
+            const realizedPnl = coin.pnl;  // closed trades only
+            // Use server trade count for VPS sessions — stateRef.trades is always 0
+            // because the browser loop never runs when sessions are on the VPS
+            // Use currentViewedSession so we show the RIGHT session's trades/P&L
+            const liveSession = currentViewedSession;
+            const tradesCount = liveSession
+              ? (parseInt(liveSession.tradesByCoin?.[effectiveCoin]) || parseInt(liveSession.totalTrades) || 0)
+              : coin.trades;
+            return (
+              <div style={{ fontSize: 11, marginTop: 4 }}>
+                <span style={{ fontWeight: 700, color }}>
+                  {netPnl >= 0 ? "+" : ""}${netPnl.toFixed(2)}
+                </span>
+                <span style={{ color: "var(--color-text-tertiary)" }}>
+                  {" "}({tradesCount} trade{tradesCount !== 1 ? "s" : ""})
+                </span>
+                {unrealizedDollar !== 0 && (
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                    Realized: {realizedPnl < 0 ? "-" : "+"}${Math.abs(realizedPnl).toFixed(2)}
+                    {" · "}
+                    <span style={{ color: unrealizedDollar >= 0 ? "#10b981" : "#f59e0b" }}>
+                      Unrealized: {unrealizedDollar < 0 ? "-" : "+"}${Math.abs(unrealizedDollar).toFixed(2)}
+                    </span>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
       </div>
 
@@ -9635,22 +10006,38 @@ function CryptoAlgoTrader() {
       )}
 
       {/* ── Trading log ──────────────────────────────────────────────────────── */}
-      {autoLog.length > 0 && (
-        <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px", marginBottom: 12 }}>
-          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8, display: "flex", justifyContent: "space-between" }}>
-            <span><i className="ti ti-terminal-2" aria-hidden="true" /> Trading log</span>
-            <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{autoLog.length} entries</span>
+      {(() => {
+        // For VPS sessions: show the server's session-scoped log (not shared browser log)
+        const serverLogs = currentViewedSession?.logs;
+        const displayLogs = serverLogs?.length > 0
+          ? serverLogs.map((l, i) => ({
+              id: i,
+              time: l.time || fmtTime(new Date(l.ts || Date.now())),
+              msg:  l.msg  || (typeof l === "string" ? l : ""),
+              type: l.type || "info",
+            }))
+          : autoLog;
+        if (!displayLogs.length) return null;
+        const sessionLabel = currentViewedSession?.name
+          ? `${currentViewedSession.name} — `
+          : "";
+        return (
+          <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px", marginBottom: 12 }}>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8, display: "flex", justifyContent: "space-between" }}>
+              <span><i className="ti ti-terminal-2" aria-hidden="true" /> {sessionLabel}Trading log</span>
+              <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{displayLogs.length} entries</span>
+            </div>
+            <div style={{ maxHeight: 140, overflowY: "auto", display: "flex", flexDirection: "column", gap: 3 }}>
+              {displayLogs.slice(0, 30).map((l) => (
+                <div key={l.id} style={{ display: "flex", gap: 8, fontSize: 10, lineHeight: 1.5, borderBottom: "0.5px solid var(--color-border-tertiary)", paddingBottom: 2 }}>
+                  <span style={{ color: "var(--color-text-tertiary)", minWidth: 68, flexShrink: 0 }}>{l.time}</span>
+                  <span style={{ color: logTypeColor[l.type] }}>{l.msg}</span>
+                </div>
+              ))}
+            </div>
           </div>
-          <div style={{ maxHeight: 140, overflowY: "auto", display: "flex", flexDirection: "column", gap: 3 }}>
-            {autoLog.slice(0, 20).map((l) => (
-              <div key={l.id} style={{ display: "flex", gap: 8, fontSize: 10, lineHeight: 1.5, borderBottom: "0.5px solid var(--color-border-tertiary)", paddingBottom: 2 }}>
-                <span style={{ color: "var(--color-text-tertiary)", minWidth: 68, flexShrink: 0 }}>{l.time}</span>
-                <span style={{ color: logTypeColor[l.type] }}>{l.msg}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* ── Transaction Log ──────────────────────────────────────────────────────── */}
       {txLog.length > 0 && (
@@ -9812,7 +10199,13 @@ function CryptoAlgoTrader() {
         <span><i className="ti ti-clock" aria-hidden="true" /> Tick {tickRef.current} ({(creds.tickIntervalMs||1500)/1000}s)</span>
         <span style={{ color: running ? "#10b981" : "#ef4444" }}>
           <i className={`ti ${running ? "ti-circle-check" : "ti-circle-x"}`} aria-hidden="true" />
-          {running && autoEnabled ? "Live trading" : running ? "Simulating" : "Stopped"}
+          {running && autoEnabled
+            ? "Live trading"
+            : running
+              ? "Simulating"
+              : currentViewedSession?.running
+                ? `🧪 ${currentViewedSession.name || "Test session"} — running on server`
+                : "Stopped"}
         </span>
         {running && (
           <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 4,

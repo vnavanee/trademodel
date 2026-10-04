@@ -522,6 +522,9 @@ async function handleSubscribe(req, res) {
       mode: "subscription",
       payment_method_types: ["card"],
       line_items: [{ price: priceId, quantity: 1 }],
+      // Shows an "Add promotion code" field on the Stripe Checkout page.
+      // Codes themselves are created in Stripe Dashboard → Product catalog → Coupons.
+      allow_promotion_codes: true,
       success_url: successUrl || `${req.headers.origin || "https://yourapp.netlify.app"}/?upgraded=1`,
       cancel_url:  cancelUrl  || `${req.headers.origin || "https://yourapp.netlify.app"}/`,
       metadata: { clerk_user_id: auth.userId },
@@ -690,11 +693,245 @@ async function handleDeletePaperSession(req, res) {
 //   if (route === "/paper-sessions" && req.method === "POST")   return handleSavePaperSession(req, res);
 //   if (route.startsWith("/paper-sessions/") && req.method === "DELETE") return handleDeletePaperSession(req, res);
 
+// ─── Strategy Marketplace Handlers ───────────────────────────────────────────
+// Phase 1: free sharing — no payments. API keys stripped before storing.
+
+// Strips API keys and position-size from creds before publishing
+function sanitiseStrategySettings(rawCreds) {
+  const {
+    // Strip sensitive fields
+    keys, apiKey, apiSecret, apiPassphrase, tradeSizeUSD, balanceBuffer,
+    // Keep everything else (signal config, indicators, exit rules, RL params etc.)
+    ...safe
+  } = rawCreds || {};
+  return safe;
+}
+
+// GET /strategies — paginated marketplace listing
+async function handleListStrategies(req, res) {
+  const url    = new URL(req.url, "http://localhost");
+  const sort   = url.searchParams.get("sort") || "total_pnl_pct";
+  const limit  = Math.min(parseInt(url.searchParams.get("limit") || "20"), 50);
+  const offset = parseInt(url.searchParams.get("offset") || "0");
+  const tag    = url.searchParams.get("tag") || null;
+  const coin   = url.searchParams.get("coin") || null;
+  const mine   = url.searchParams.get("mine") === "1";
+
+  const sb   = getSupabase();
+  const auth = mine ? await requireAuth(req, res) : null;
+  if (mine && !auth) return; // requireAuth already responded
+
+  const validSorts = ["total_pnl_pct", "win_rate", "total_trades",
+                       "subscriber_count", "created_at"];
+  const safeSort = validSorts.includes(sort) ? sort : "total_pnl_pct";
+
+  let q = sb.from("shared_strategies")
+    .select(`
+      strategy_id, user_id, name, description, tags, coins,
+      signal_source, total_pnl_pct, win_rate, total_trades,
+      max_drawdown, subscriber_count, created_at, updated_at,
+      strategy_ratings(stars)
+    `)
+    .eq("is_published", true)
+    .order(safeSort, { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (tag)  q = q.contains("tags", [tag]);
+  if (coin) q = q.contains("coins", [coin]);
+  if (mine && auth) q = q.eq("user_id", auth.userId);
+
+  const { data, error } = await q;
+  if (error) {
+    console.error("[strategies/list]", error.code, error.message);
+    if (error.code === "42P01") return res.status(200).json({ strategies: [] });
+    return res.status(500).json({ error: "Failed to load strategies" });
+  }
+
+  // Compute avg rating from nested array
+  const strategies = (data || []).map(s => {
+    const ratings = s.strategy_ratings || [];
+    const avgStars = ratings.length
+      ? (ratings.reduce((sum, r) => sum + r.stars, 0) / ratings.length).toFixed(1)
+      : null;
+    const { strategy_ratings: _, ...rest } = s;
+    return { ...rest, avgStars, ratingCount: ratings.length };
+  });
+
+  res.status(200).json({ strategies });
+}
+
+// GET /strategies/:id — single strategy with full settings
+async function handleGetStrategy(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  const id  = url.pathname.split("/").pop();
+  const sb  = getSupabase();
+
+  const { data, error } = await sb.from("shared_strategies")
+    .select(`
+      *, strategy_ratings(stars, review, user_id, created_at),
+      strategy_copies(count)
+    `)
+    .eq("strategy_id", id)
+    .eq("is_published", true)
+    .single();
+
+  if (error || !data) return res.status(404).json({ error: "Strategy not found" });
+
+  const ratings = data.strategy_ratings || [];
+  const avgStars = ratings.length
+    ? (ratings.reduce((s, r) => s + r.stars, 0) / ratings.length).toFixed(1)
+    : null;
+
+  res.status(200).json({ ...data, avgStars, ratingCount: ratings.length });
+}
+
+// POST /strategies — publish a strategy
+async function handlePublishStrategy(req, res) {
+  const auth = await requireAuth(req, res); if (!auth) return;
+  let body;
+  try { body = typeof req.body === "string" ? JSON.parse(req.body) : req.body; }
+  catch { return res.status(400).json({ error: "Invalid JSON" }); }
+
+  const { name, description = "", tags = [], creds, coins, signalSource } = body || {};
+  if (!name?.trim()) return res.status(400).json({ error: "Strategy name required" });
+  if (!creds)        return res.status(400).json({ error: "Settings (creds) required" });
+
+  const settings = sanitiseStrategySettings(creds);
+  const sb = getSupabase();
+
+  const { data, error } = await sb.from("shared_strategies").insert({
+    user_id:       auth.userId,
+    name:          name.trim().slice(0, 80),
+    description:   description.trim().slice(0, 500),
+    tags:          (tags || []).map(t => t.toLowerCase().trim()).filter(Boolean).slice(0, 5),
+    settings,
+    coins:         coins || creds.enabledCoins || ["BTC"],
+    signal_source: signalSource || creds.signalSource || "rules",
+  }).select("strategy_id, name").single();
+
+  if (error) {
+    console.error("[strategies/publish]", error.code, error.message);
+    return res.status(500).json({ error: "Failed to publish strategy" });
+  }
+  res.status(201).json({ ok: true, strategyId: data.strategy_id, name: data.name });
+}
+
+// POST /strategies/:id/copy — record a copy event + return the settings
+async function handleCopyStrategy(req, res) {
+  const auth = await requireAuth(req, res); if (!auth) return;
+  const url  = new URL(req.url, "http://localhost");
+  const id   = url.pathname.split("/").slice(-2)[0]; // /strategies/:id/copy
+
+  const sb   = getSupabase();
+  const { data: strategy, error: sErr } = await sb.from("shared_strategies")
+    .select("strategy_id, settings, coins, signal_source, subscriber_count")
+    .eq("strategy_id", id).eq("is_published", true).single();
+
+  if (sErr || !strategy) return res.status(404).json({ error: "Strategy not found" });
+
+  // Record copy (upsert — re-copying returns the same settings, no duplicate row)
+  await sb.from("strategy_copies").upsert(
+    { strategy_id: id, copier_id: auth.userId },
+    { onConflict: "strategy_id,copier_id" }
+  );
+
+  // Increment subscriber count
+  await sb.from("shared_strategies")
+    .update({ subscriber_count: (strategy.subscriber_count || 0) + 1 })
+    .eq("strategy_id", id);
+
+  res.status(200).json({ ok: true, settings: strategy.settings,
+    coins: strategy.coins, signalSource: strategy.signal_source });
+}
+
+// POST /strategies/:id/rate — submit or update a rating
+async function handleRateStrategy(req, res) {
+  const auth = await requireAuth(req, res); if (!auth) return;
+  let body;
+  try { body = typeof req.body === "string" ? JSON.parse(req.body) : req.body; }
+  catch { return res.status(400).json({ error: "Invalid JSON" }); }
+
+  const url    = new URL(req.url, "http://localhost");
+  const id     = url.pathname.split("/").slice(-2)[0];
+  const stars  = parseInt(body?.stars);
+  const review = (body?.review || "").trim().slice(0, 500);
+
+  if (!stars || stars < 1 || stars > 5)
+    return res.status(400).json({ error: "Stars must be 1-5" });
+
+  const sb = getSupabase();
+  const { error } = await sb.from("strategy_ratings").upsert(
+    { strategy_id: id, user_id: auth.userId, stars, review },
+    { onConflict: "strategy_id,user_id" }
+  );
+
+  if (error) return res.status(500).json({ error: "Failed to save rating" });
+  res.status(200).json({ ok: true });
+}
+
+// DELETE /strategies/:id — unpublish own strategy
+async function handleUnpublishStrategy(req, res) {
+  const auth = await requireAuth(req, res); if (!auth) return;
+  const url  = new URL(req.url, "http://localhost");
+  const id   = url.pathname.split("/").pop();
+  const sb   = getSupabase();
+
+  const { error } = await sb.from("shared_strategies")
+    .update({ is_published: false })
+    .eq("strategy_id", id)
+    .eq("user_id", auth.userId);
+
+  if (error) return res.status(500).json({ error: "Failed to unpublish" });
+  res.status(200).json({ ok: true });
+}
+
+// GET /leaderboard — top strategies sorted by performance
+async function handleLeaderboard(req, res) {
+  const url   = new URL(req.url, "http://localhost");
+  const sort  = url.searchParams.get("sort") || "total_pnl_pct";
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "25"), 50);
+
+  const validSorts = ["total_pnl_pct", "win_rate", "subscriber_count",
+                       "total_trades", "created_at"];
+  const safeSort = validSorts.includes(sort) ? sort : "total_pnl_pct";
+  const sb = getSupabase();
+
+  const { data, error } = await sb.from("shared_strategies")
+    .select(`
+      strategy_id, name, description, coins, signal_source, tags,
+      total_pnl_pct, win_rate, total_trades, max_drawdown,
+      subscriber_count, created_at,
+      strategy_ratings(stars)
+    `)
+    .eq("is_published", true)
+    .order(safeSort, { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    if (error.code === "42P01") return res.status(200).json({ leaderboard: [] });
+    return res.status(500).json({ error: "Failed to load leaderboard" });
+  }
+
+  const leaderboard = (data || []).map((s, i) => {
+    const ratings = s.strategy_ratings || [];
+    const avgStars = ratings.length
+      ? (ratings.reduce((sum, r) => sum + r.stars, 0) / ratings.length).toFixed(1)
+      : null;
+    const { strategy_ratings: _, ...rest } = s;
+    return { rank: i + 1, ...rest, avgStars, ratingCount: ratings.length };
+  });
+
+  res.status(200).json({ leaderboard, sortedBy: safeSort });
+}
+
 module.exports = {
   requireAuth, requirePlan,
   handleGetSettings, handlePutSettings,
   handlePostTransaction, handleGetTransactions,
   handleSubscribe, handleStripeWebhook, handleUserCreated,
   handleListPaperSessions, handleSavePaperSession, handleDeletePaperSession,
+  handleListStrategies, handleGetStrategy, handlePublishStrategy,
+  handleCopyStrategy, handleRateStrategy, handleUnpublishStrategy,
+  handleLeaderboard,
   encryptCreds, decryptCreds,
 };
